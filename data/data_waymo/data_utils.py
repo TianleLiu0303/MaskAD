@@ -444,7 +444,7 @@ def data_process_scenario(
         polylines,
         polylines_valid,
         current_index=current_index,
-        max_route_lanes=32,        # 你可以自己设
+        max_route_lanes=25,        # 你可以自己设
         max_match_dist=10.0,       # 匹配距离阈值，也可以调
     )
 
