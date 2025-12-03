@@ -438,9 +438,19 @@ def data_process_scenario(
         polylines = np.pad(polylines, ((0, max_polylines-polylines.shape[0]), (0, 0), (0, 0)))
         polylines_valid = np.pad(polylines_valid, (0, max_polylines-polylines_valid.shape[0]))
 
+
+    route_lanes, route_lanes_valid, route_lane_indices = compute_route_lanes_from_scenario(
+        scenario,
+        polylines,
+        polylines_valid,
+        current_index=current_index,
+        max_route_lanes=32,        # 你可以自己设
+        max_match_dist=10.0,       # 匹配距离阈值，也可以调
+    )
+
     relations = calculate_relations(agents_history, polylines, traffic_light_points)
     relations = np.asarray(relations)
-    
+
     data_dict = {
         'agents_history': np.float32(agents_history),
         'agents_interested': np.int32(agents_interested),
@@ -451,8 +461,122 @@ def data_process_scenario(
         'polylines_valid': np.int32(polylines_valid),
         'relations': np.float32(relations),
         'agents_id': np.int32(agents_id),
+        'route_lanes': np.float32(route_lanes),
+        'route_lanes_valid': np.int32(route_lanes_valid),
+        'route_lane_indices': np.int32(route_lane_indices),
     }
     return data_dict
+
+def compute_route_lanes_from_scenario(
+    scenario,
+    polylines,
+    polylines_valid,
+    current_index=10,
+    max_route_lanes=32,
+    max_match_dist=10.0,
+):
+    """
+    根据 SDC 的未来 log_trajectory，在 map polylines 中匹配出 route_lanes。
+
+    Args:
+        scenario: datatypes.SimulatorState
+        polylines: [num_polylines, num_points, 5]，data_process_scenario 里已经构造好的
+        polylines_valid: [num_polylines,]
+        current_index: 当前时刻索引
+        max_route_lanes: 最多保留多少条 route lane
+        max_match_dist: 匹配 polyline 时的最大距离阈值（米）
+
+    Returns:
+        route_lanes: [num_route_lanes, num_points, 5]
+        route_lanes_valid: [num_route_lanes,]
+        route_lane_indices: [num_route_lanes,]  # 在原 polylines 中的索引
+    """
+    log_traj = scenario.log_trajectory
+    metadata = scenario.object_metadata
+
+    # 找到 SDC 的 index
+    sdc_idx = np.where(np.asarray(metadata.is_sdc))[0]
+    if len(sdc_idx) == 0:
+        # 没有 SDC，就返回空
+        route_lanes = np.zeros((1, polylines.shape[1], polylines.shape[2]), dtype=np.float32)
+        route_lanes_valid = np.zeros((1,), dtype=np.int32)
+        route_lane_indices = np.zeros((1,), dtype=np.int32)
+        return route_lanes, route_lanes_valid, route_lane_indices
+
+    sdc_idx = sdc_idx[0]
+
+    # SDC 从 current_index 往后的未来轨迹
+    sdc_xy = np.asarray(log_traj.xy[sdc_idx])       # [T, 2]
+    sdc_valid = np.asarray(log_traj.valid[sdc_idx]) # [T]
+    sdc_future_xy = sdc_xy[current_index:]
+    sdc_future_valid = sdc_valid[current_index:]
+    if sdc_future_xy.shape[0] == 0:
+        route_lanes = np.zeros((1, polylines.shape[1], polylines.shape[2]), dtype=np.float32)
+        route_lanes_valid = np.zeros((1,), dtype=np.int32)
+        route_lane_indices = np.zeros((1,), dtype=np.int32)
+        return route_lanes, route_lanes_valid, route_lane_indices
+
+    # 只保留有效的未来点
+    sdc_future_xy = sdc_future_xy[sdc_future_valid]
+
+    if sdc_future_xy.shape[0] == 0:
+        route_lanes = np.zeros((1, polylines.shape[1], polylines.shape[2]), dtype=np.float32)
+        route_lanes_valid = np.zeros((1,), dtype=np.int32)
+        route_lane_indices = np.zeros((1,), dtype=np.int32)
+        return route_lanes, route_lanes_valid, route_lane_indices
+
+    # 只在 valid 的 polylines 上做匹配
+    valid_mask = polylines_valid.astype(bool)
+    if not np.any(valid_mask):
+        route_lanes = np.zeros((1, polylines.shape[1], polylines.shape[2]), dtype=np.float32)
+        route_lanes_valid = np.zeros((1,), dtype=np.int32)
+        route_lane_indices = np.zeros((1,), dtype=np.int32)
+        return route_lanes, route_lanes_valid, route_lane_indices
+
+    valid_polys = polylines[valid_mask, :, :2]  # [M, P, 2]
+    valid_indices = np.where(valid_mask)[0]
+
+    # 对每个未来点，找到最近的 polyline index
+    matched_poly_indices = []
+    # 可以间隔采样一点，减少计算量（比如每 2~3 帧一个）
+    step = max(1, sdc_future_xy.shape[0] // 30)  # 最多采 30 个点
+    sampled_future_xy = sdc_future_xy[::step]
+
+    for p in sampled_future_xy:
+        # p: [2]
+        # 计算它到每个 polyline 上所有点的距离，取最小值
+        diff = valid_polys - p[None, None, :]                # [M,P,2]
+        dist = np.linalg.norm(diff, axis=-1)                 # [M,P]
+        min_dist = dist.min(axis=-1)                         # [M]
+        best_idx_in_valid = np.argmin(min_dist)
+        best_dist = min_dist[best_idx_in_valid]
+
+        if best_dist <= max_match_dist:
+            poly_global_idx = valid_indices[best_idx_in_valid]
+            matched_poly_indices.append(poly_global_idx)
+
+    if len(matched_poly_indices) == 0:
+        route_lanes = np.zeros((1, polylines.shape[1], polylines.shape[2]), dtype=np.float32)
+        route_lanes_valid = np.zeros((1,), dtype=np.int32)
+        route_lane_indices = np.zeros((1,), dtype=np.int32)
+        return route_lanes, route_lanes_valid, route_lane_indices
+
+    # 去掉连续重复，保持按时间顺序
+    route_lane_indices = []
+    for idx in matched_poly_indices:
+        if len(route_lane_indices) == 0 or route_lane_indices[-1] != idx:
+            route_lane_indices.append(idx)
+
+    # 限制数量
+    route_lane_indices = np.array(route_lane_indices[:max_route_lanes], dtype=np.int32)
+
+    # 根据索引取出对应的 polyline
+    route_lanes = polylines[route_lane_indices]  # [R, num_points, 5]
+    route_lanes_valid = np.ones((route_lanes.shape[0],), dtype=np.int32)
+
+    # 如果不足 max_route_lanes，可以不 pad，也可以和你 polylines 一样 pad，视你模型需要
+    return route_lanes.astype(np.float32), route_lanes_valid, route_lane_indices
+
 
 def data_collate_fn(batch_list):
     """
@@ -477,3 +601,4 @@ def data_collate_fn(batch_list):
             input_batch[key] = value
             
     return input_batch
+
