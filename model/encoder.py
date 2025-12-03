@@ -26,6 +26,31 @@ class Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        self.hidden_dim = config.hidden_dim
+
+        self.token_num = config.agent_num + config.static_objects_num + config.lane_num
+
+        self.agent_encoder = AgentFusionEncoder(
+            time_len=config.past_len,
+            drop_path_rate=config.encoder_drop_path_rate,
+            hidden_dim=config.hidden_dim,
+            depth=config.encoder_depth,
+            tokens_mlp_dim=config.encoder_tokens_mlp_dim,
+            channels_mlp_dim=config.encoder_channels_mlp_dim,
+        )
+
+        self.static_encoder = StaticFusionEncoder(
+            dim=10,
+            drop_path_rate=config.encoder_drop_path_rate,
+            hidden_dim=config.hidden_dim,
+        )
+
+
+
+        
+
+        # position embedding encode x, y, cos, sin, type
+        self.pos_emb = nn.Linear(7, config.hidden_dim)
 
 
     def forward(self, x):
