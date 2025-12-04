@@ -107,7 +107,6 @@ class JointAttention(Module):
         masks: tuple[Tensor | None] | None = None,
         attn_dist = None,
     ):
-
         device = self.dummy.device
 
         B = inputs[0].shape[0]
@@ -141,14 +140,16 @@ class JointAttention(Module):
         # merge heads and then separate by modality for combine heads projection
 
         outs = self.merge_heads(outs)
-        outs = unpack(outs, packed_shape, 'b * d')
 
-        # separate combination of heads for each modality
+        # outs = unpack(outs, packed_shape, 'b * d')
 
-        all_outs = []
+        # # separate combination of heads for each modality
 
-        for out, to_out in zip(outs, self.out_proj):
-            out = to_out(out)
-            all_outs.append(out)
+        # all_outs = []
 
-        return tuple(all_outs)
+        # for out, to_out in zip(outs, self.out_proj):
+        #     out = to_out(out)
+        #     all_outs.append(out)
+
+        # return tuple(all_outs)
+        return outs.view(B, self.token_num, -1)
