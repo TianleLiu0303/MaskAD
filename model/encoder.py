@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
-from MaskAD.model.tools.global_attention import JointAttention
+from MaskAD.model.modules.global_attention import JointAttention
 from MaskAD.model.utils import build_attn_bias_from_scene
 
 class MixerBlock(nn.Module):
@@ -306,54 +306,6 @@ class LaneFusionEncoder(nn.Module):
         
         return x_result.view(B, P, -1) , mask_p.reshape(B, -1), pos.view(B, P, -1)
 
-class RouteEncoder(nn.Module):
-    def __init__(self, route_num, route_points_num, drop_path_rate=0.3, hidden_dim=192, tokens_mlp_dim=32, channels_mlp_dim=64):
-        super().__init__()
-
-        self._channel = channels_mlp_dim
-
-        self.channel_pre_project = Mlp(in_features=4, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.)
-        self.token_pre_project = Mlp(in_features=route_num * route_points_num, hidden_features=tokens_mlp_dim, out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.)
-
-        self.Mixer = MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate)
-
-        self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
-
-    def forward(self, x):
-        '''
-        x: B, P, V, D
-        speed_limit: B, P, 1
-        has_speed_limit: B, P, 1
-        '''
-        # only x and x->x' vector, no boundary, no speed limit, no traffic light
-        x = x[..., :4]
-
-        B, P, V, _ = x.shape
-        mask_v = torch.sum(torch.ne(x[..., :4], 0), dim=-1).to(x.device) == 0
-        mask_p = torch.sum(~mask_v, dim=-1) == 0
-        mask_b = torch.sum(~mask_p, dim=-1) == 0
-        x = x.view(B, P * V, -1)
-
-        valid_indices = ~mask_b.view(-1) 
-        x = x[valid_indices] 
-
-        x = self.channel_pre_project(x)
-
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
-
-        x = self.Mixer(x)
-        x = torch.mean(x, dim=1)
-
-        x = self.emb_project(self.norm(x))
-
-        x_result = torch.zeros((B, x.shape[-1]), device=x.device)
-        x_result[valid_indices] = x  # Fill in valid parts
-        
-        return x_result.view(B, -1)
-
 ####### KV encoder #################
 class FusionEncoder(nn.Module):
     def __init__(self, hidden_dim=192, num_heads=6, drop_path_rate=0.3, depth=3, device='cuda'):
@@ -391,9 +343,9 @@ if __name__ == "__main__":
     config = SimpleNamespace()
     config.hidden_dim = 192
 
-    config.agent_num = 16               # neighbor_agents_past 里 P 的大小
-    config.static_objects_num = 32
-    config.lane_num = 64
+    config.agent_num = 32               # neighbor_agents_past 里 P 的大小
+    config.static_objects_num = 5
+    config.lane_num = 70
 
     config.past_len = 20               # AgentFusionEncoder: time_len
     config.lane_len = 20               # LaneFusionEncoder: lane_len
