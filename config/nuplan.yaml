@@ -1,0 +1,36 @@
+####  train config  ####
+batch_size: 16
+ego_neighbor_weight: 2.0
+lr: 0.0001
+weight_decay: 0.01
+lr_warmup_step: 1000
+lr_step_freq: 1000
+lr_step_gamma: 0.5
+hidden_dim: 192
+agent_num: 33
+static_objects_num: 5
+lane_num: 70
+past_len: 21
+lane_len: 20
+
+#### encoder config  ####
+encoder_drop_path_rate: 0.1
+encoder_depth: 2
+encoder_tokens_mlp_dim: 64
+encoder_channels_mlp_dim: 128
+encoder_dim_head: 48
+encoder_num_heads: 4
+enable_encoder_attn_dist: true
+encoder_attn_dropout: 0.1
+
+
+# decoder config  ####
+decoder_drop_path_rate: 0.1
+num_heads: 4
+predicted_neighbor_num: 32
+future_len: 80
+route_num: 25
+decoder_depth: 1
+
+##### normalization config  ####
+normalization_file_path: "/home/ltl/code/MaskAD/config/normalization.json"

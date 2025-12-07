@@ -1,11 +1,13 @@
 import torch
 from torch import Tensor
+from typing import Optional
+
 
 def build_attn_bias_from_scene(
     neighbors: Tensor,   # [B, N_neighbors, T_hist, D_n]
     static: Tensor,      # [B, N_static, D_s]
     lanes: Tensor,       # [B, N_lanes, P, D_l]
-    max_distance: float | None = None,
+    max_distance: Optional[float] = None,
 ) -> Tensor:
     """
     根据 neighbors / static / lanes 构造 JointAttention 使用的 attn_bias。

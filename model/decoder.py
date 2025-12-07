@@ -23,14 +23,14 @@ class Decoder(nn.Module):
         self.dit = DiT(
             route_encoder = RouteEncoder(config.route_num, config.lane_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim),
             depth=config.decoder_depth, 
-            output_dim= (config.future_len) * 3, # x, y, cos, sin
+            output_dim= (config.future_len) * 4, # x, y, cos, sin
             hidden_dim=config.hidden_dim, 
             heads=config.num_heads, 
             dropout=dpr,
         )
     def forward(self, encoder_outputs, inputs):
         ego_current = inputs['ego_current_state'][:, None, :4]
-        neighbors_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num, -1, :4]
+        neighbors_current = inputs["agents_past"][:, 1:, -1, :4]
         neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0
         inputs["neighbor_current_mask"] = neighbor_current_mask
 
@@ -42,7 +42,11 @@ class Decoder(nn.Module):
         ego_neighbor_encoding = encoder_outputs['encoding']
         route_lanes = inputs['route_lanes']
 
-        sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
+        mask_emb = encoder_outputs['mask_emb'] # [B, N, T, D_model]
+
+        sampled_trajectories = inputs['sampled_trajectories'] + mask_emb # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
+        sampled_trajectories = sampled_trajectories.reshape(B, P, -1)
+        # sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
         diffusion_time = inputs['diffusion_time']
 
         return {
@@ -52,7 +56,7 @@ class Decoder(nn.Module):
                     ego_neighbor_encoding,
                     route_lanes,
                     neighbor_current_mask
-                ).reshape(B, P, -1, 3)
+                ).reshape(B, P, -1, 4)
         }
 
 
@@ -98,7 +102,7 @@ class DiT(nn.Module):
               x: 主序列输入张量，形状为 (B, 32， 256)
               cross_c: 交叉注意力条件张量，形状为 (B, 336, 256)
               y: 条件张量，形状为 (B, 256)
-              attn_mask: 注意力掩码，形状为 (B, 32)
+              attn_mask: 注意力掩码，形状为 (B, 33)
         输出:
               x: 形状为 (B, 32, 256)
             '''

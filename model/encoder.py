@@ -73,7 +73,7 @@ class Encoder(nn.Module):
 
         encoder_outputs = {}
 
-        neighbors = inputs['neighbor_agents_past']
+        agents = inputs['agents_past']
 
         # static objects
         static = inputs['static_objects']
@@ -84,27 +84,27 @@ class Encoder(nn.Module):
         lanes_has_speed_limit = inputs['lanes_has_speed_limit']
 
 
-        B = neighbors.shape[0]
+        B = agents.shape[0]
 
-        encoding_neighbors, neighbors_mask, neighbor_pos = self.agent_encoder(neighbors)
+        encoding_agents, agents_mask, agent_pos = self.agent_encoder(agents)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(lanes, lanes_speed_limit, lanes_has_speed_limit)
 
         attn_dist = build_attn_bias_from_scene(
-            neighbors,
+            agents,
             static,
             lanes,
             max_distance=None,
         )
         encoding_output = self.fusion_ecoder(
-            (encoding_neighbors, encoding_static, encoding_lanes),
-            (neighbors_mask, static_mask, lanes_mask),
+            (encoding_agents, encoding_static, encoding_lanes),
+            (agents_mask, static_mask, lanes_mask),
             attn_dist,
         )
         # encoding_input = torch.cat([encoding_neighbors, encoding_static, encoding_lanes], dim=1)
 
-        encoding_pos = torch.cat([neighbor_pos, static_pos, lane_pos], dim=1).view(B * self.token_num, -1)
-        encoding_mask = torch.cat([neighbors_mask, static_mask, lanes_mask], dim=1).view(-1)
+        encoding_pos = torch.cat([agent_pos, static_pos, lane_pos], dim=1).view(B * self.token_num, -1)
+        encoding_mask = torch.cat([agents_mask, static_mask, lanes_mask], dim=1).view(-1)
         encoding_pos = self.pos_emb(encoding_pos[~encoding_mask])
         encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim), device=encoding_pos.device)
         encoding_pos_result[~encoding_mask] = encoding_pos  # Fill in valid parts
@@ -115,8 +115,10 @@ class Encoder(nn.Module):
            # 加上位置 embedding
         encoding_output = encoding_output + encoding_pos_result.view(B, self.token_num, -1)
 
+
         encoder_outputs['encoding'] = encoding_output
-        encoder_outputs['neighbors_mask'] = neighbors_mask
+        encoder_outputs['encoding_agents'] = encoding_agents
+        encoder_outputs['agents_mask'] = agents_mask
         encoder_outputs['static_mask'] = static_mask
         encoder_outputs['lanes_mask'] = lanes_mask
 
@@ -343,7 +345,7 @@ if __name__ == "__main__":
     config = SimpleNamespace()
     config.hidden_dim = 192
 
-    config.agent_num = 32               # neighbor_agents_past 里 P 的大小
+    config.agent_num = 33               # neighbor_agents_past 里 P 的大小
     config.static_objects_num = 5
     config.lane_num = 70
 
@@ -387,7 +389,7 @@ if __name__ == "__main__":
     routes = torch.randn(B, 4, 10, 4, device=device)  # 只是举例，shape 随便
 
     inputs = {
-        "neighbor_agents_past": neighbor_agents_past,
+        "agents_past": neighbor_agents_past,
         "static_objects": static_objects,
         "lanes": lanes,
         "lanes_speed_limit": lanes_speed_limit,
@@ -404,7 +406,8 @@ if __name__ == "__main__":
     # ===== 4. 打印检查一下 =====
     encoding = outputs["encoding"]
     print("encoding shape:", encoding.shape)  # 期望: [B, token_num, hidden_dim]
-    print("neighbors_mask shape:", outputs["neighbors_mask"].shape)
+    print("encoding_agents shape:", outputs["encoding_agents"].shape)   
+    print("agents_mask shape:", outputs["agents_mask"].shape)
     print("static_mask shape:", outputs["static_mask"].shape)
     print("lanes_mask shape:", outputs["lanes_mask"].shape)
 

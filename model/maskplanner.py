@@ -1,8 +1,14 @@
 import torch
 import torch.nn as nn
 import lightning.pytorch as pl
+from pathlib import Path
+from types import SimpleNamespace
+import yaml
 from MaskAD.model.encoder import Encoder
 from MaskAD.model.decoder import Decoder
+from MaskAD.model.modules.mask import MaskNet
+from MaskAD.utils.data_augmentation import StatePerturbation
+from MaskAD.utils.normalizer import ObservationNormalizer, StateNormalizer  
 # from MaskAD.model.utils import DDPM_Sampler
 from torch.nn.functional import smooth_l1_loss, cross_entropy
 
@@ -92,6 +98,20 @@ class MaskPlanner(pl.LightningModule):
         self.decoder = Diffusion_Decoder(config)
         # self.sampler = DDPM_Sampler(config)
 
+        self.mask_net = MaskNet(
+            hidden_dim=config.hidden_dim,   # scene_feat 的 D 维
+            T_fut=config.future_len,        # 未来步数 T
+            d_model=4,      # 先用 hidden_dim 做 DiT 的 mask emb 维度
+            time_emb_dim=64,
+            num_heads=config.num_heads,
+            mlp_hidden=128,
+        )
+
+        self.aug = StatePerturbation()
+
+        self.state_normalizer = StateNormalizer.from_json(config)
+        self.obs_normalizer = ObservationNormalizer.from_json(config)
+
         #------------------- Optimizer and Scheduler -------------------
     def configure_optimizers(self):
         '''
@@ -151,9 +171,21 @@ class MaskPlanner(pl.LightningModule):
         
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
-    def forward(self, inputs):
-        encoder_outputs = self.encoder(inputs)
-        decoder_outputs = self.decoder(encoder_outputs, inputs)
+    def forward(self, batch):
+
+        batch = self.obs_normalizer(batch)
+        encoder_outputs = self.encoder(batch)
+      
+        
+        mask, mask_emb = self.mask_net(encoder_outputs['encoding'], encoder_outputs['encoding_agents'])
+        
+        encoder_outputs['mask'] = mask
+        encoder_outputs['mask_emb'] = mask_emb
+
+        decoder_outputs = self.decoder(encoder_outputs, batch)
+
+        decoder_outputs['x_start'] = self.state_normalizer.inverse(decoder_outputs['x_start'])
+
         return decoder_outputs
 
     def training_step(self, batch, batch_idx):
@@ -185,20 +217,55 @@ class MaskPlanner(pl.LightningModule):
         return loss
 
     def forward_and_get_loss(self, batch):
-        
+
         encoder_outputs = self.encoder(batch)
+        
+        ego_future = batch['ego_agent_future']                # [B, T, D]
+        neighbors_future = batch['neighbor_agents_future']    # [B, A-1, T, D]
+
+        batch, ego_future, neighbors_future = self.aug(batch, ego_future, neighbors_future)
+
+        batch = self.obs_normalizer(batch)
+
+        ego_future = torch.cat(
+            [
+                ego_future[..., :2],
+                torch.stack(
+                    [ego_future[..., 2].cos(), ego_future[..., 2].sin()], dim=-1
+                ),
+            ],
+            dim=-1,
+            )
+        mask_neighbor = torch.sum(torch.ne(neighbors_future[..., :3], 0), dim=-1) == 0
+        neighbors_future = torch.cat(
+            [
+                neighbors_future[..., :2],
+                torch.stack(
+                    [neighbors_future[..., 2].cos(), neighbors_future[..., 2].sin()], dim=-1
+                ),
+            ],
+            dim=-1,
+            )
+        neighbors_future[mask_neighbor] = 0.
+
+        mask, mask_emb = self.mask_net(encoder_outputs['encoding'], encoder_outputs['encoding_agents'])
+        
+        #  mask: torch.Size([2, 33, 80]), mask_emb: torch.Size([2, 33, 80, 4])
+        encoder_outputs['mask'] = mask
+        encoder_outputs['mask_emb'] = mask_emb
+
         decoder_outputs = self.decoder(encoder_outputs, batch)
 
         pred = decoder_outputs['x_start']  # [B, P, (future_len + 1) * 4]
-        
-        ego_future = batch['ego_agent_future']                # [B, T, D]
-        neighbor_futures = batch['neighbor_agents_future']    # [B, A-1, T, D]
 
         # 拼成 [B, A, T, D]，保证与 pred 对齐
         target = torch.cat([
             ego_future[:, None, :, :],    # [B, 1, T, D]
-            neighbor_futures              # [B, A-1, T, D]
+            neighbors_future              # [B, A-1, T, D]
         ], dim=1)
+
+
+        target = self.state_normalizer(target)
 
         # ======== Split Ego & Neighbors ========
         pred_ego = pred[:, 0, :, :]             # [B, T, D]
@@ -208,87 +275,95 @@ class MaskPlanner(pl.LightningModule):
         gt_neighbors   = target[:, 1:, :, :]
 
         # ======== Loss Calculation ========
-        ego_loss = smooth_l1_loss(pred_ego, gt_ego, reduction='mean')
+  # ======== 4. 从 mask 中取出 ego / neighbor 对应的部分 ========
+        # mask: [B, P, T]
+        mask_ego = mask[:, 0, :]        # [B, T]
+        mask_nbr = mask[:, 1:, :]       # [B, A-1, T]
 
-        # neighbor 数量可以不固定，只要维度能对齐即可
-        neighbor_loss = smooth_l1_loss(pred_neighbors, gt_neighbors, reduction='mean')
+        # 我们用 (1 - mask) 作为 imitation 的权重：越确定 → 权重越大
+        weight_ego = 1.0 - mask_ego                 # [B, T]
+        weight_nbr = 1.0 - mask_nbr                 # [B, A-1, T]
 
+        # 为了和误差维度对齐，最后一维加一个维度
+        weight_ego = weight_ego.unsqueeze(-1)       # [B, T, 1]
+        weight_nbr = weight_nbr.unsqueeze(-1)       # [B, A-1, T, 1]
+
+        # 防止全 0 掉梯度
+        eps = 1e-6
+
+        # ======== 5. 加权 ego loss ========
+        ego_loss_raw = smooth_l1_loss(
+            pred_ego, gt_ego, reduction='none'      # [B, T, D]
+        )
+        # 广播 weight_ego: [B,T,1] → [B,T,D]
+        ego_loss_weighted = ego_loss_raw * weight_ego
+        ego_loss = ego_loss_weighted.sum() / (weight_ego.sum() * ego_loss_raw.shape[-1] + eps)
+
+        # ======== 6. 加权 neighbor loss ========
+        neighbor_loss_raw = smooth_l1_loss(
+            pred_neighbors, gt_neighbors, reduction='none'   # [B, A-1, T, D]
+        )
+        # weight_nbr: [B,A-1,T,1] → 广播到 [B,A-1,T,D]
+        neighbor_loss_weighted = neighbor_loss_raw * weight_nbr
+        neighbor_loss = neighbor_loss_weighted.sum() / (weight_nbr.sum() * neighbor_loss_raw.shape[-1] + eps)
+
+        # ======== 7. 汇总 ========
         total_loss = self.cfg.ego_neighbor_weight * ego_loss + neighbor_loss
 
         log_dict = {
             "loss": total_loss,
             "ego_loss": ego_loss.detach(),
             "neighbor_loss": neighbor_loss.detach(),
+            "mask_ego_mean": mask_ego.mean().detach(),
+            "mask_nbr_mean": mask_nbr.mean().detach(),
         }
 
         return total_loss, log_dict
-
-
-
-
+ 
+ 
 ######################test##############################
 
+def load_config_from_yaml(cfg_path):
+    """
+    Load a config YAML file into a SimpleNamespace for attribute-style access.
+    """
+    cfg_path = Path(cfg_path)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    return SimpleNamespace(**data)
+
+def inspect_gradients(model):
+    """
+    打印每个参数的:
+      - 完整名字
+      - 是否需要梯度 (requires_grad)
+      - 是否得到了梯度 (grad is None?)
+      - 梯度范数 (grad_norm)
+    """
+    print("\n========== 模型梯度检查 ==========\n")
+    for name, p in model.named_parameters():
+        req = p.requires_grad
+        has_grad = p.grad is not None
+        grad_norm = p.grad.norm().item() if has_grad else None
+        print(f"{name:60s} | req_grad={req} | has_grad={has_grad} | grad_norm={grad_norm}")
+    print("\n========== 结束 ==========\n")
+
+
+
 def test():
-    from types import SimpleNamespace
+    cfg_path = Path(__file__).resolve().parents[1] / "config" / "nuplan.yaml"
+    config = load_config_from_yaml(cfg_path)
 
-    # ===== 1. 配一个简单的 config =====
-    config = SimpleNamespace()
-    config.ego_neighbor_weight = 2.0  # ego loss 的权重
-    config.lr = 1e-4                  # 下面用不到，但可以先占位
-    config.weight_decay = 1e-2
-    config.lr_warmup_step = 1000            
-    config.lr_step_freq = 1000
-    config.lr_step_gamma = 0.5
- 
- ##### encoder 配置 #####
-    config.hidden_dim = 192
-
-    config.agent_num = 32               # neighbor_agents_past 里 P 的大小
-    config.static_objects_num = 5
-    config.lane_num = 70
-
-    config.past_len = 21               # AgentFusionEncoder: time_len
-    config.lane_len = 20               # LaneFusionEncoder: lane_len
-
-    config.encoder_drop_path_rate = 0.1
-    config.encoder_depth = 2
-    config.encoder_tokens_mlp_dim = 64
-    config.encoder_channels_mlp_dim = 128
-
-    config.encoder_dim_head = 48
-    config.encoder_num_heads = 4
-    config.enable_encoder_attn_dist = True
-    config.encoder_attn_dropout = 0.1
-    
-
-#######  decoder 配置 #####
-    config.decoder_drop_path_rate = 0.1
-    config.encoder_drop_path_rate = 0.1
-    config.hidden_dim = 192
-    config.num_heads = 4
-
-    config.predicted_neighbor_num = 32      # P = 1(ego) + 31 = 32
-    config.future_len = 80                  # 未来 40 帧 -> (40 + 1) * 4 维度
-    config.route_num = 25                 
-    config.lane_len = 20                    # 对应 V
-    config.decoder_depth = 1  
-
-    
-    # ====== 2. 实例化模型，并把 config 挂到 model 上 ======
+    # ====== 1. 实例化模型 ======
     model = MaskPlanner(config)
-
-    model.eval()
 
     batch_size = 2          # batch size
 
     batch = {
         "ego_current_state": torch.randn(batch_size, 10).float(),
-
-        "ego_agent_future": torch.randn(batch_size, 80, 3).float(),
-
-        "neighbor_agents_past": torch.randn(batch_size, 32, 21, 11).float(),
-        "neighbor_agents_future": torch.randn(batch_size, 32, 80, 3).float(),
-
+        "agents_past": torch.randn(batch_size, 33, 21, 11).float(),
+    
         "static_objects": torch.randn(batch_size, 5, 10).float(),
 
         "lanes": torch.randn(batch_size, 70, 20, 12).float(),
@@ -298,16 +373,63 @@ def test():
         "route_lanes": torch.randn(batch_size, 25, 20, 12).float(),
         "route_lanes_speed_limit": torch.randn(batch_size, 25, 1).float(),
         "route_lanes_has_speed_limit": torch.randint(0, 2, (batch_size, 25, 1)).bool(),
-        "sampled_trajectories": torch.randn(batch_size, 33, 80 * 3).float(),
+
+        "neighbor_agents_future": torch.randn(batch_size, 32, 80, 3).float(),
+        "ego_agent_future": torch.randn(batch_size, 80, 3).float(),
+
+        "sampled_trajectories": torch.randn(batch_size, 33, 80, 4).float(),
         "diffusion_time": torch.randint(0, 1000, (batch_size,)).float(),
     }
 
-    # ====== 5. 调用 forward_and_get_loss，打印结果 ======
-    loss, log_dict = model.forward_and_get_loss(batch)
+    # ====== 2. 先 eval 一个前向 + loss 看数值 ======
+    model.eval()
+    with torch.no_grad():
+        loss, log_dict = model.forward_and_get_loss(batch)
 
-    print("total loss:", loss.item())
+    print("=== 前向检查 ===")
+    print("total loss (no grad):", loss.item())
     for k, v in log_dict.items():
         print(f"{k}: {v.item()}")
+
+    # ====== 3. 测试梯度能不能正常反向传播 ======
+    model.train()  # 切回训练模式
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer.zero_grad()
+
+    loss, log_dict = model.forward_and_get_loss(batch)  # 带图的 forward
+    loss.backward()
+
+    # 3.1 整体 grad 范数
+    total_grad_sq = 0.0
+    for _, p in model.named_parameters():
+        if p.grad is not None:
+            total_grad_sq += p.grad.norm().item() ** 2
+    total_grad_norm = total_grad_sq ** 0.5
+    print("\n=== 反向传播检查 ===")
+    print("total grad norm:", total_grad_norm)
+
+    # 3.2 重点看看 mask_net 有没有梯度
+    print("\n=== MaskNet 梯度检查 ===")
+    for name, p in model.named_parameters():
+        if "mask_net" in name:
+            has_grad = p.grad is not None
+            grad_norm = p.grad.norm().item() if has_grad else None
+            print(f"{name:60s} | has_grad={has_grad} | grad_norm={grad_norm}")
+
+    # 3.3 打印所有模块、所有参数的梯度状态
+    inspect_gradients(model)
+
+    # 3.4 简单走一步优化（确认不会报错）
+    optimizer.step()
+
+    # ====== 4. 测试 forward 输出形状 ======
+    model.eval()
+    decoder_outputs = model.forward(batch)   # 你的 forward 目前返回 decoder_outputs dict
+    pred = decoder_outputs['x_start']        # [B, P, T, D] or [B, P, (future_len+1)*4]
+    print("\n=== forward 输出检查 ===")
+    print("pred shape:", pred.shape)
+
 
 
 
