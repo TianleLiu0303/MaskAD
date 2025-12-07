@@ -33,4 +33,4 @@ route_num: 25
 decoder_depth: 1
 
 ##### normalization config  ####
-normalization_file_path: "/home/ltl/code/MaskAD/config/normalization.json"
+normalization_file_path: "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/normalization.json"
