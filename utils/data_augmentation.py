@@ -304,3 +304,94 @@ class StatePerturbation():
         ], dim=1)
 
         return torch.concatenate([torch.cat([traj_x, traj_y, traj_heading[..., None]], axis=-1), ego_future[:, P:, :]], axis=1)
+
+
+
+import torch
+import numpy as np
+
+def main():
+    device = torch.device("cpu")   # 需要的话改成 "cuda"
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    batch_size = 2          # batch size
+
+    # =======================
+    # 构造一个假 batch（按你给的格式）
+    # =======================
+    batch = {
+        "ego_current_state": torch.randn(batch_size, 10, device=device).float(),
+
+        "ego_agent_future": torch.randn(batch_size, 80, 3, device=device).float(),
+
+        "neighbor_agents_past": torch.randn(batch_size, 32, 21, 11, device=device).float(),
+        "neighbor_agents_future": torch.randn(batch_size, 32, 80, 3, device=device).float(),
+
+        "static_objects": torch.randn(batch_size, 5, 10, device=device).float(),
+
+        "lanes": torch.randn(batch_size, 70, 20, 12, device=device).float(),
+        "lanes_speed_limit": torch.randn(batch_size, 70, 1, device=device).float(),
+        "lanes_has_speed_limit": torch.randint(0, 2, (batch_size, 70, 1), device=device).bool(),
+
+        "route_lanes": torch.randn(batch_size, 25, 20, 12, device=device).float(),
+        "route_lanes_speed_limit": torch.randn(batch_size, 25, 1, device=device).float(),
+        "route_lanes_has_speed_limit": torch.randint(0, 2, (batch_size, 25, 1), device=device).bool(),
+
+        "sampled_trajectories": torch.randn(batch_size, 33, 80 * 3, device=device).float(),
+        "diffusion_time": torch.randint(0, 1000, (batch_size,), device=device).float(),
+    }
+
+    # 为了保证一定有 batch 被扰动：强行把 vx 设置大一点
+    # ego_current_state: [x, y, cos, sin, vx, vy, ax, ay, steering, yaw_rate]
+    batch["ego_current_state"][:, 4] = 3.0  # |vx| > 2 保证通过 augment 的速度筛选
+
+    print("原始 ego_current_state[0]:", batch["ego_current_state"][0])
+    print("原始 ego_future[0, :3]:", batch["ego_agent_future"][0, :3])
+    print("原始 neighbor_future[0, 0, :3]:", batch["neighbor_agents_future"][0, 0, :3])
+
+    # =======================
+    # 构造 StatePerturbation
+    # =======================
+    perturb = StatePerturbation(
+        augment_prob=0.0,   # 设成 0.0 => rand >= 0 恒为 True，只要 |vx|>=2 就会被扰动
+        device=device,
+    )
+
+    # 构造 inputs / ego_future / neighbors_future 传给 __call__
+    inputs = {
+        "ego_current_state": batch["ego_current_state"].clone(),
+        "neighbor_agents_past": batch["neighbor_agents_past"].clone(),
+        "lanes": batch["lanes"].clone(),
+        "route_lanes": batch["route_lanes"].clone(),
+        "static_objects": batch["static_objects"].clone(),
+    }
+    ego_future = batch["ego_agent_future"].clone()
+    neighbors_future = batch["neighbor_agents_future"].clone()
+
+    # =======================
+    # 调用 StatePerturbation
+    # =======================
+    out_inputs, out_ego_future, out_neighbors_future = perturb(
+        inputs, ego_future, neighbors_future
+    )
+
+    print("\n===== 输出的 shape 检查 =====")
+    print("ego_current_state:", out_inputs["ego_current_state"].shape)
+    print("ego_future:", out_ego_future.shape)
+    print("neighbors_future:", out_neighbors_future.shape)
+    print("neighbor_agents_past:", out_inputs["neighbor_agents_past"].shape)
+    print("lanes:", out_inputs["lanes"].shape)
+    print("route_lanes:", out_inputs["route_lanes"].shape)
+    print("static_objects:", out_inputs["static_objects"].shape)
+
+    # 简单看下数值是否有明显变化（说明确实做了扰动 + 坐标变换）
+    print("\n扰动 + 坐标变换后的 ego_current_state[0]:", out_inputs["ego_current_state"][0])
+    print("扰动 + 插值后的 ego_future[0, :3]:", out_ego_future[0, :3])
+    print("扰动后的 neighbor_future[0, 0, :3]:", out_neighbors_future[0, 0, :3])
+
+    print("\n测试结束：若上面没有报错，说明在你这个 batch 格式下 StatePerturbation 可以正常运行。")
+
+
+if __name__ == "__main__":
+    main()
