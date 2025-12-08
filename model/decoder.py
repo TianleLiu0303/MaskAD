@@ -23,7 +23,7 @@ class Decoder(nn.Module):
         self.dit = DiT(
             route_encoder = RouteEncoder(config.route_num, config.lane_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim),
             depth=config.decoder_depth, 
-            output_dim= (config.future_len) * 4, # x, y, cos, sin
+            output_dim= (config.future_len+1) * 4, # x, y, cos, sin
             hidden_dim=config.hidden_dim, 
             heads=config.num_heads, 
             dropout=dpr,
@@ -43,8 +43,16 @@ class Decoder(nn.Module):
         route_lanes = inputs['route_lanes']
 
         mask_emb = encoder_outputs['mask_emb'] # [B, N, T, D_model]
+        traj = inputs['sampled_trajectories']  
+        # 拆开当前 + 未来
+        traj_current = traj[:, :, :1, :]    # [B, P, 1, 4]
+        traj_future  = traj[:, :, 1:, :]    # [B, P, T, 4]
 
-        sampled_trajectories = inputs['sampled_trajectories'] + mask_emb # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
+        # 只对未来部分加 mask
+        traj_future = traj_future + mask_emb
+
+        # 再拼回去
+        sampled_trajectories = torch.cat([traj_current, traj_future], dim=2)  # [B, P, 1+T, 4]
         sampled_trajectories = sampled_trajectories.reshape(B, P, -1)
         # sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
         diffusion_time = inputs['diffusion_time']
@@ -85,14 +93,18 @@ class DiT(nn.Module):
         self.final_layer = FinalLayer(hidden_dim, output_dim)
                
     def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask):
+        print("x的shape是：", x.shape)
         B, P, _ = x.shape # 
 
         x = self.preproj(x) # 维度为[B, 33, 256]
 
         navigation_encoding = self.route_encoder(route_lanes) # 维度是（B, 256）
         y = navigation_encoding
-        y = y + self.t_embedder(t)  # # 维度是（B, 256）
+        print("navigation_encoding shape:", navigation_encoding.shape)
 
+        ##### 一下为调试代码 #####
+        y = y + self.t_embedder(t)  # # 维度是（B, 256）
+        print("y shape:", y.shape)
         attn_mask = torch.zeros((B, P), dtype=torch.bool, device=x.device)
         attn_mask[:,1:] = neighbor_current_mask 
         

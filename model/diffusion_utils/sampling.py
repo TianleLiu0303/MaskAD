@@ -24,7 +24,7 @@ def dpm_sampler(
         model_fn = dpm.model_wrapper(
             model,  # use your noise prediction model here
             noise_schedule,
-            model_type=model.model_type,  # or "x_start" or "v" or "score"
+            # model_type=model.model_type,  # or "x_start" or "v" or "score"
             model_kwargs=other_model_params,
             **model_wrapper_params
         )

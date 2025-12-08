@@ -39,7 +39,7 @@ class MaskADataset(Dataset):
         ego_current_state       = data['ego_current_state']          # [10] 或 [T0, D]
         ego_agent_future        = data['ego_agent_future']           # [T_f, D_f]
 
-        neighbor_agents_past    = data['neighbor_agents_past']       # [N_all, T_p, D_p]
+        agents_past             = data['agents_past']       # [N_all, T_p, D_p]
         neighbor_agents_future  = data['neighbor_agents_future']     # [N_all, T_f, D_f]
 
         lanes                   = data['lanes']
@@ -53,7 +53,24 @@ class MaskADataset(Dataset):
         static_objects          = data['static_objects']
 
         # 截取邻居数量
-        neighbor_agents_past   = neighbor_agents_past[:self._past_neighbor_num]
+        # neighbor_agents_past   = neighbor_agents_past[:self._past_neighbor_num]
+
+
+        # # ###### 此处为临时测试代码 ####################################################
+        # T_past = neighbor_agents_past.shape[1]
+        # D_past = neighbor_agents_past.shape[2]
+
+        # ego_past = torch.zeros((1, T_past, D_past), dtype=torch.float32)
+
+        # # 3. 拼成 agents_past: [1(ego) + N(nbr), T, D]
+        # agents_past = torch.cat([ego_past, torch.as_tensor(neighbor_agents_past)], dim=0)
+        # # 生成占位的采样轨迹和扩散时间（调试用）
+        # num_agents = agents_past.shape[0]
+        # T_future = ego_agent_future.shape[0]
+        # sampled_trajectories = torch.randn((num_agents, T_future, 4), dtype=torch.float32)
+        # diffusion_time = torch.randint(0, 1000, (1,), dtype=torch.long)
+        # ############################################################################
+
         neighbor_agents_future = neighbor_agents_future[:self._predicted_neighbor_num]
 
         # 可选：裁剪未来长度
@@ -64,9 +81,10 @@ class MaskADataset(Dataset):
         # 转成 torch.Tensor（如果你后面全是 torch）
         sample = {
             "ego_current_state":          torch.as_tensor(ego_current_state).float(),
-            "ego_future_gt":              torch.as_tensor(ego_agent_future).float(),
-            "neighbor_agents_past":       torch.as_tensor(neighbor_agents_past).float(),
-            "neighbors_future_gt":        torch.as_tensor(neighbor_agents_future).float(),
+            "ego_agent_future":           torch.as_tensor(ego_agent_future).float(),
+            # "neighbor_agents_past":       torch.as_tensor(neighbor_agents_past).float(),
+            'agents_past':                torch.as_tensor(agents_past).float(),
+            "neighbor_agents_future":     torch.as_tensor(neighbor_agents_future).float(),
 
             "lanes":                      torch.as_tensor(lanes).float(),
             "lanes_speed_limit":          torch.as_tensor(lanes_speed_limit).float(),
@@ -106,7 +124,7 @@ def main():
         "predicted_neighbor_num": 32,
         "future_len": 80,
 
-        "batch_size": 3,
+        "batch_size": 2,
         "num_workers": 2,
     }
 

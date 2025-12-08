@@ -1,3 +1,55 @@
+# ============================
+# Python cache
+# ============================
 __pycache__/
-__pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+
+# ============================
+# VSCode / PyCharm
+# ============================
+.vscode/
+.idea/
+
+# ============================
+# Logs and checkpoints
+# ============================
+train_logs/
+**/checkpoints/
+*.ckpt
+*.log
+*.out
+events.out.tfevents.*
+
+# ============================
+# NuPlan / Waymo data
+# ============================
+data/
+data_nuplan/
+data_waymo/
+*.npz
+*.pkl
+*.tfrecord
+
+# ============================
+# Temporary / cache files
+# ============================
+*.cache
+.cache/
+output/
+outputs/
+results/
+runs/
+
+# ============================
+# Environment files
+# ============================
+.env
+*.swp
+
+# ============================
+# OS generated
+# ============================
+.DS_Store
+Thumbs.db
