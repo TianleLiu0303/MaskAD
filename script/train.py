@@ -1,4 +1,5 @@
 import os
+import argparse
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Union
@@ -10,25 +11,24 @@ import lightning.pytorch as pl
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
+# ====== 模型 & 数据集 ======
 from MaskAD.model.maskplanner import MaskPlanner
-from MaskAD.data_process.dataset import MaskADataset   # 就是你刚才那个 MaskADataset
+from MaskAD.GRPO.GRPO_nuplan import MaskPlannerGRPO
+from MaskAD.data_process.dataset import MaskADataset
 
 
-# ================== 1. 这里填你的数据路径 ==================
-# 注意：这几个路径在 yaml 里没有，所以在 train.py 里手动指定
-
+# ================== 1. 数据路径（你可以按需改） ==================
 TRAIN_DATA_DIR = "/mnt/pai-pdc-nas/tianle_DPR/nuplan/dataset/processed_data"
 TRAIN_LIST_JSON = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/diffusion_planner.json"
 
-# 如果你现在还没有单独的验证集，可以先暂时用训练集做 val，或者自己再做一个 json
 VAL_DATA_DIR = TRAIN_DATA_DIR
 VAL_LIST_JSON = TRAIN_LIST_JSON
-# 例如你之后可以改成：
+# 例如未来你可以改成：
 # VAL_LIST_JSON = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/diffusion_planner_val.json"
 
 
 # ================== 2. 加载 yaml ==================
-def load_config_from_yaml(cfg_path):
+def load_config_from_yaml(cfg_path: Union[str, Path]) -> SimpleNamespace:
     """
     Load a config YAML file into a SimpleNamespace for attribute-style access.
     """
@@ -37,6 +37,7 @@ def load_config_from_yaml(cfg_path):
         data = yaml.safe_load(f) or {}
 
     return SimpleNamespace(**data)
+
 
 # ================== 3. DataLoader 构建 ==================
 def build_dataloaders(cfg: SimpleNamespace):
@@ -91,24 +92,111 @@ def build_dataloaders(cfg: SimpleNamespace):
     return train_loader, val_loader
 
 
-# ================== 4. 主训练入口 ==================
+# ================== 4. 从 IL ckpt 加载 encoder/decoder 权重 ==================
+def init_grpo_from_il_ckpt(
+    grpo_model: MaskPlannerGRPO,
+    il_ckpt_path: Union[str, Path],
+):
+    """
+    从 IL 阶段的 checkpoint 中加载 encoder 和 decoder 的权重到 GRPO 模型中。
+    - 只拷贝 'encoder.' 和 'decoder.' 开头的参数
+    - 其余（如 optimizer 状态）不加载
+    """
+    il_ckpt_path = Path(il_ckpt_path)
+    assert il_ckpt_path.exists(), f"IL checkpoint not found: {il_ckpt_path}"
+
+    print(f"[GRPO Init] Loading IL checkpoint from: {il_ckpt_path}")
+    ckpt = torch.load(il_ckpt_path, map_location="cpu")
+    state_dict = ckpt["state_dict"]
+
+    encoder_dict = {}
+    decoder_dict = {}
+
+    for k, v in state_dict.items():
+        if k.startswith("encoder."):
+            # 去掉前缀 "encoder."
+            new_k = k[len("encoder."):]
+            encoder_dict[new_k] = v
+        elif k.startswith("decoder."):
+            new_k = k[len("decoder."):]
+            decoder_dict[new_k] = v
+
+    missing, unexpected = grpo_model.encoder.load_state_dict(encoder_dict, strict=False)
+    print(f"[GRPO Init] Encoder loaded. missing={len(missing)}, unexpected={len(unexpected)}")
+
+    missing, unexpected = grpo_model.decoder.load_state_dict(decoder_dict, strict=False)
+    print(f"[GRPO Init] Decoder loaded. missing={len(missing)}, unexpected={len(unexpected)}")
+
+    # old_decoder 会在 __init__ 和 on_train_epoch_end 中由 decoder 拷贝，不需要额外处理
+
+
+# ================== 5. 主训练入口 ==================
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--cfg",
+        type=str,
+        default="/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/nuplan.yaml",
+        help="Path to yaml config file.",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="il",
+        choices=["il", "grpo"],
+        help="Training mode: 'il' for imitation learning, 'grpo' for RL fine-tuning.",
+    )
+    parser.add_argument(
+        "--il_ckpt",
+        type=str,
+        default=None,
+        help="(Optional) IL checkpoint path to init GRPO model's encoder & decoder.",
+    )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=None,
+        help="Number of GPUs to use (override cfg.device if given).",
+    )
+
+    args = parser.parse_args()
+
     pl.seed_everything(42)
 
-    # 假设 train.py 放在 MaskAD/ 目录下，yaml 在 MaskAD/config/nuplan.yaml
-    cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/nuplan.yaml"
+    # ===== 1. 读取配置 =====
+    cfg = load_config_from_yaml(args.cfg)
 
-    cfg = load_config_from_yaml(cfg_path)
+    # mode 优先级：命令行参数 > cfg.train_mode (如果有) > 默认 "il"
+    if args.mode is not None:
+        train_mode = args.mode
+    else:
+        train_mode = getattr(cfg, "train_mode", "il")
 
-    # ===== 1. 实例化 LightningModule =====
-    model = MaskPlanner(cfg)
+    assert train_mode in ["il", "grpo"], f"Unknown train_mode: {train_mode}"
+    print(f"[Train] mode = {train_mode}")
 
-    # ===== 2. DataLoader =====
+    # ===== 2. 实例化 LightningModule =====
+    if train_mode == "il":
+        model = MaskPlanner(cfg)
+        exp_suffix = "IL"
+    else:
+        model = MaskPlannerGRPO(cfg)
+
+        # 如果给了 IL checkpoint，就用它初始化 encoder & decoder
+        if args.il_ckpt is not None:
+            init_grpo_from_il_ckpt(model, args.il_ckpt)
+        else:
+            print("[GRPO Init] No IL ckpt provided, GRPO starts from current weights.")
+
+        exp_suffix = "GRPO"
+
+    # ===== 3. DataLoader =====
     train_loader, val_loader = build_dataloaders(cfg)
 
-    # ===== 3. Logger & Checkpoint =====
+    # ===== 4. Logger & Checkpoint =====
     save_dir = cfg.save_dir
-    exp_name = cfg.exp_name
+    exp_name = cfg.exp_name + f"_{exp_suffix}"
 
     logger = TensorBoardLogger(
         save_dir=save_dir,
@@ -129,10 +217,10 @@ def main():
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
-    # ===== 4. Trainer =====
+    # ===== 5. Trainer =====
     max_epochs = getattr(cfg, "epoch", 50)
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    devices = getattr(cfg, "device", 1)
+    devices = args.devices if args.devices is not None else getattr(cfg, "device", 1)
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -145,7 +233,7 @@ def main():
         check_val_every_n_epoch=1,
     )
 
-    # ===== 5. 开始训练 =====
+    # ===== 6. 开始训练 =====
     trainer.fit(model, train_loader, val_loader)
 
 

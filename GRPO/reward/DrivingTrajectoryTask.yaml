@@ -1,0 +1,70 @@
+# Name of the task
+name: DrivingTrajectoryTask
+
+physics_engine: ${..physics_engine}   # 为了与框架兼容，可保留但不会使用
+
+env:
+  # 并行环境数量
+  numEnvs: ${resolve_default:2048,${...num_envs}}
+  
+  # 本任务不依赖仿真 spacing，但需要保持与框架兼容
+  envSpacing: 1
+
+  # 一条轨迹产生一个 episode，因此 episodeLength = 1
+  episodeLength: 1
+
+  enableDebugVis: False
+
+  # =============== 轨迹规划相关参数 ===============
+  # 观测维度，需与你代码中的 self.num_obs 对应
+  numObservations: 64
+  
+  # 每个未来 step 的动作维度，例如 (x,y,yaw) 就是 3
+  per_step_action_dim: 2
+  
+  # 预测未来多少个点
+  planning_horizon: 16
+  
+  # action 总维度 = planning_horizon * per_step_action_dim
+  # 不需要写，自动计算
+
+  # =============== 奖励参数（你可以自定义）===============
+  reward:
+    weight_goal: 1.0
+    weight_smooth: 0.1
+    collision_penalty: -5.0
+
+  # 将来可加任何你需要的自动驾驶指标
+  # 例如：
+  # weight_lane: 1.0
+  # weight_speed: 0.5
+
+  # =============== 用于数据集的设置（如果你需要）==========
+  dataset:
+    use_dataset: False        # 如果你后面需要加载 nuPlan/Waymo，可在此开启
+    dataset_path: ""          # 数据路径（预留）
+
+# -----------------------------------------------------------
+# 仿真相关设置：基本不使用，但为了保持 IsaacGymEnvs 完整结构保留
+# -----------------------------------------------------------
+sim:
+  dt: 0.1
+  substeps: 1
+  up_axis: "z"
+  use_gpu_pipeline: False
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: False
+    num_position_iterations: 1
+    num_velocity_iterations: 0
+    contact_offset: 0.0
+    rest_offset: 0.0
+
+# -----------------------------------------------------------
+# task-level config (randomization placeholder)
+# -----------------------------------------------------------
+task:
+  randomize: False
+  randomization_params: {}

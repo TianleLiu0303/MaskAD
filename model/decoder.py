@@ -93,18 +93,15 @@ class DiT(nn.Module):
         self.final_layer = FinalLayer(hidden_dim, output_dim)
                
     def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask):
-        print("x的shape是：", x.shape)
         B, P, _ = x.shape # 
 
         x = self.preproj(x) # 维度为[B, 33, 256]
 
         navigation_encoding = self.route_encoder(route_lanes) # 维度是（B, 256）
         y = navigation_encoding
-        print("navigation_encoding shape:", navigation_encoding.shape)
 
         ##### 一下为调试代码 #####
         y = y + self.t_embedder(t)  # # 维度是（B, 256）
-        print("y shape:", y.shape)
         attn_mask = torch.zeros((B, P), dtype=torch.bool, device=x.device)
         attn_mask[:,1:] = neighbor_current_mask 
         
