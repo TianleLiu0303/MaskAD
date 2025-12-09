@@ -1,0 +1,20 @@
+Metadata-Version: 2.1
+Name: MaskAD
+Version: 0.1.0
+Summary: Mask-based autonomous driving planner for nuPlan/Bench2Drive.
+Home-page: UNKNOWN
+Author: Tianle Liu
+Author-email: liutianle@zju.edu.cn
+License: MIT
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Operating System :: POSIX :: Linux
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.8
+Description-Content-Type: text/plain
+
+MaskAD: A mask-guided diffusion planner for autonomous driving.
+

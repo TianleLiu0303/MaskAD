@@ -96,7 +96,7 @@ class MaskPlanner(pl.LightningModule):
         super().__init__()
 
         self.cfg = config
-        
+        self.save_hyperparameters(self.cfg)
         self.encoder = Diffusion_Encoder(config)
         self.decoder = Diffusion_Decoder(config)
         # self.sampler = DDPM_Sampler(config)
@@ -308,7 +308,7 @@ class MaskPlanner(pl.LightningModule):
         模型的训练步骤。
         """        
         loss, log_dict = self.forward_train(batch)
-        train_log = {f"train/{k}": v for k, v in log_dict.items()}
+        train_log = {f"train_{k}": v for k, v in log_dict.items()}
         self.log_dict(train_log, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
         return loss
     
@@ -317,7 +317,7 @@ class MaskPlanner(pl.LightningModule):
         Validation step of the model.
         """
         loss, log_dict = self.forward_train(batch)
-        val_log = {f"val/{k}": v for k, v in log_dict.items()}
+        val_log = {f"val_{k}": v for k, v in log_dict.items()}
         self.log_dict(val_log, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
         return loss
 
@@ -445,8 +445,6 @@ class MaskPlanner(pl.LightningModule):
             "loss": total_loss,
             "ego_loss": ego_loss.detach(),
             "neighbor_loss": neighbor_loss.detach(),
-            "mask_ego_mean": mask_ego.mean().detach(),
-            "mask_nbr_mean": mask_nbr.mean().detach(),
         }
 
         return total_loss, log_dict

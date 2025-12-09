@@ -2,9 +2,45 @@ import torch
 import random
 import numpy as np
 from mmengine import fileio
+from pathlib import Path
 import io
 import os
 import json
+from types import SimpleNamespace
+import lightning.pytorch as pl
+from omegaconf import OmegaConf
+
+def save_args_json(cfg: SimpleNamespace, model: pl.LightningModule, log_dir: str):
+    """
+    模仿 Diffusion-Planner 的行为，把当前训练用到的配置 + normalizer 的统计
+    保存为 args.json，方便之后评估 / 推理使用。
+    """
+
+    # 1. SimpleNamespace -> dict
+    cfg_dict = vars(cfg).copy()
+
+    # 2. normalizer，如有则加入
+    state_norm = getattr(model, "state_normalizer", None)
+    if state_norm is not None and hasattr(state_norm, "to_dict"):
+        cfg_dict["state_normalizer"] = state_norm.to_dict()
+
+    obs_norm = getattr(model, "obs_normalizer", None)
+    if obs_norm is not None and hasattr(obs_norm, "to_dict"):
+        cfg_dict["observation_normalizer"] = obs_norm.to_dict()
+
+    # 3. 使用 OmegaConf 的自动转换功能（最稳的方法）
+    cfg_dict = OmegaConf.to_container(cfg_dict, resolve=True)
+
+    # 4. 保存 JSON
+    args_path = Path(log_dir) / "args.json"
+    args_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with args_path.open("w", encoding="utf-8") as f:
+        json.dump(cfg_dict, f, indent=4, ensure_ascii=False)
+
+    print(f"[Config] args.json saved to: {args_path}")
+
+
 
 def openjson(path):
        value  = fileio.get_text(path)

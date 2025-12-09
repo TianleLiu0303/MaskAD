@@ -1,0 +1,28 @@
+maskplanner:
+  _target_: MaskAD.planner.planner.MaskADPlanner
+  _convert_: "all"
+
+  config:
+    _target_: MaskAD.planner.config.config.Config
+    _convert_: "all"
+
+    args_file: ???
+
+    guidance_fn: null
+  ckpt_path: ???
+
+  past_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+
+    num_poses: 20
+    time_horizon: 2
+
+  future_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+
+    num_poses: 80
+    time_horizon: 8
+
+  device: cuda

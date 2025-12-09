@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Union
+from datetime import datetime
 
 import yaml
 import torch
@@ -15,7 +16,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from MaskAD.model.maskplanner import MaskPlanner
 from MaskAD.GRPO.GRPO_nuplan import MaskPlannerGRPO
 from MaskAD.data_process.dataset import MaskADataset
-
+from MaskAD.utils.train_utils import save_args_json
 
 # ================== 1. 数据路径（你可以按需改） ==================
 TRAIN_DATA_DIR = "/mnt/pai-pdc-nas/tianle_DPR/nuplan/dataset/processed_data"
@@ -28,15 +29,12 @@ VAL_LIST_JSON = TRAIN_LIST_JSON
 
 
 # ================== 2. 加载 yaml ==================
-def load_config_from_yaml(cfg_path: Union[str, Path]) -> SimpleNamespace:
-    """
-    Load a config YAML file into a SimpleNamespace for attribute-style access.
-    """
-    cfg_path = Path(cfg_path)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+from omegaconf import OmegaConf
 
-    return SimpleNamespace(**data)
+def load_config_from_yaml(cfg_path):
+    cfg = OmegaConf.load(cfg_path)
+    return cfg
+
 
 
 # ================== 3. DataLoader 构建 ==================
@@ -195,13 +193,17 @@ def main():
     train_loader, val_loader = build_dataloaders(cfg)
 
     # ===== 4. Logger & Checkpoint =====
-    save_dir = cfg.save_dir
-    exp_name = cfg.exp_name + f"_{exp_suffix}"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_dir = os.path.join(cfg.save_dir, timestamp)
+    exp_name = f"{cfg.exp_name}_{exp_suffix}"
 
     logger = TensorBoardLogger(
         save_dir=save_dir,
         name=exp_name,
     )
+
+    log_dir = logger.log_dir
+    # save_args_json(cfg, model, log_dir)
 
     ckpt_dir = Path(save_dir) / exp_name / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -209,18 +211,18 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         save_top_k=3,
-        monitor="val/loss",          # 对应 validation_step 里 log 的 key
+        monitor="val_loss",          # 对应 validation_step 里 log 的 key
         mode="min",
-        filename="epoch{epoch:02d}-valloss{val/loss:.4f}",
+        filename="{epoch:02d}-{val_loss:.4f}",
         save_last=True,
     )
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
     # ===== 5. Trainer =====
-    max_epochs = getattr(cfg, "epoch", 50)
+    max_epochs = getattr(cfg, "epochs", 50)
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    devices = args.devices if args.devices is not None else getattr(cfg, "device", 1)
+    devices = cfg.devices
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -230,7 +232,7 @@ def main():
         callbacks=[checkpoint_callback, lr_monitor],
         gradient_clip_val=getattr(cfg, "grad_clip", 1.0),
         log_every_n_steps=50,
-        check_val_every_n_epoch=1,
+        check_val_every_n_epoch=5,
     )
 
     # ===== 6. 开始训练 =====

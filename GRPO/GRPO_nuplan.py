@@ -33,7 +33,7 @@ class MaskPlannerGRPO(MaskPlanner):
     """
     def __init__(self, config):
         super().__init__(config)
-
+        self.save_hyperparameters(config)
         self._future_len = config.future_len
         self._agents_len = 1 + config.predicted_neighbor_num
         self._diffusion_steps = config.diffusion_steps
