@@ -16,7 +16,6 @@ __pycache__/
 # Logs and checkpoints
 # ============================
 train_logs/
-**/checkpoints/
 *.ckpt
 *.log
 *.out
