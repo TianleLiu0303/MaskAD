@@ -18,9 +18,9 @@ from MaskAD.GRPO.utils import (
     extract,
     make_timesteps,
     build_physical_states_from_future,
-    compute_grpo_trajectory_reward,
     compute_total_grad_norm,
 )
+from MaskAD.GRPO.rewards.nuplan_metric import compute_grpo_trajectory_reward
 
 
 # =========================
@@ -323,7 +323,8 @@ class MaskPlannerGRPO(MaskPlanner):
             final_states5_GB,
             batch=batch,
             v_target=5.0,
-            collision_dist=2.0,
+            collision_dist_margin=0.5,
+            dt = 0.4,
         )  # [G,B]
 
         rewards = rewards_GB.permute(1, 0).contiguous()  # [B,G]

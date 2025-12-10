@@ -96,7 +96,7 @@ class MaskPlanner(pl.LightningModule):
         super().__init__()
 
         self.cfg = config
-        self.save_hyperparameters(self.cfg)
+        # self.save_hyperparameters(self.cfg)
         self.encoder = Diffusion_Encoder(config)
         self.decoder = Diffusion_Decoder(config)
         # self.sampler = DDPM_Sampler(config)
