@@ -34,10 +34,6 @@ events.out.tfevents.*
 # ============================
 *.cache
 .cache/
-output/
-outputs/
-results/
-runs/
 
 # ============================
 # Environment files
