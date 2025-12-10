@@ -96,7 +96,7 @@ class MaskPlanner(pl.LightningModule):
         super().__init__()
 
         self.cfg = config
-        self.save_hyperparameters(self.cfg)
+        # self.save_hyperparameters(self.cfg)
         self.encoder = Diffusion_Encoder(config)
         self.decoder = Diffusion_Decoder(config)
         # self.sampler = DDPM_Sampler(config)
@@ -481,7 +481,7 @@ def inspect_gradients(model):
 
 
 def test():
-    cfg_path = Path(__file__).resolve().parents[1] / "config" / "nuplan.yaml"
+    cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/nuplan.yaml"
     config = load_config_from_yaml(cfg_path)
 
     # ====== 1. 实例化模型 ======
@@ -554,7 +554,24 @@ def test():
 
     # ====== 4. 测试 forward 输出形状 ======
     model.eval()
-    decoder_outputs = model.forward_inference(batch)   # 你的 forward 目前返回 decoder_outputs dict
+    batch_v2 = {
+        "ego_current_state": torch.randn(batch_size, 10).float(),
+        "agents_past": torch.randn(batch_size, 33, 21, 11).float(),
+    
+        "static_objects": torch.randn(batch_size, 5, 10).float(),
+
+        "lanes": torch.randn(batch_size, 70, 20, 12).float(),
+        "lanes_speed_limit": torch.randn(batch_size, 70, 1).float(),
+        "lanes_has_speed_limit": torch.randint(0, 2, (batch_size, 70, 1)).bool(),
+
+        "route_lanes": torch.randn(batch_size, 25, 20, 12).float(),
+        "route_lanes_speed_limit": torch.randn(batch_size, 25, 1).float(),
+        "route_lanes_has_speed_limit": torch.randint(0, 2, (batch_size, 25, 1)).bool(),
+    }
+    for k,v in batch_v2.items():
+        if isinstance(v, torch.Tensor):
+            batch_v2[k] = v.cuda()
+    decoder_outputs = model.forward_inference(batch_v2)   # 你的 forward 目前返回 decoder_outputs dict
     pred = decoder_outputs['prediction']        # [B, P, T, D] or [B, P, (future_len+1)*4]
     print("\n=== forward 输出检查 ===")
     print("pred shape:", pred.shape)

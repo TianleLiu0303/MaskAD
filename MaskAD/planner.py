@@ -1,6 +1,9 @@
 import warnings
 from typing import Any, Deque, Dict, List, Type
-
+from typing import Dict
+import torch
+import torch.serialization as ts
+from omegaconf import DictConfig
 import torch
 import numpy as np
 
@@ -87,43 +90,64 @@ class MaskADPlanner(AbstractPlanner):
     # ------------------------------------------------------------------
     # 初始化：加载地图、路网、模型权重
     # ------------------------------------------------------------------
-
     def initialize(self, initialization: PlannerInitialization) -> None:
-        """Inherited."""
         self._map_api = initialization.map_api
         self._route_roadblock_ids = initialization.route_roadblock_ids
         self._initialization = initialization
 
         if self._ckpt_path is not None:
-            state_dict: Dict = torch.load(self._ckpt_path, map_location=self._device)
+            print(f"[MaskADPlanner] loading ckpt with weights_only=False: {self._ckpt_path}")
+            # 1) 允许 DictConfig 被反序列化，关闭 weights_only
+            with ts.safe_globals([DictConfig]):
+                state_dict: Dict = torch.load(
+                    self._ckpt_path,
+                    map_location=self._device,
+                    weights_only=False,
+                )
 
-            # 兼容几种保存方式：
-            # 1) 我们自己 torch.save({'ema_state_dict':..., 'model':...})
-            # 2) Lightning 默认的 torch.save({'state_dict':...})
+            # 2) 兼容不同的保存格式
             if self._ema_enabled and "ema_state_dict" in state_dict:
                 model_state = state_dict["ema_state_dict"]
             elif "state_dict" in state_dict:
-                # Lightning checkpoint
-                model_state = state_dict["state_dict"]
+                model_state = state_dict["state_dict"]      # Lightning ckpt
             elif "model" in state_dict:
-                model_state = state_dict["model"]
+                model_state = state_dict["model"]           # 自己 torch.save({"model": ...})
             else:
-                # 直接就是 state_dict
-                model_state = state_dict
+                model_state = state_dict                    # 直接就是 state_dict
 
-            # 去掉可能的 'module.' 前缀（DDP 的情况）
-            cleaned_state = {}
+            # 3) 去掉 'module.' 前缀（DDP）
+            cleaned_state: Dict[str, torch.Tensor] = {}
             for k, v in model_state.items():
                 if k.startswith("module."):
                     cleaned_state[k[len("module."):]] = v
                 else:
                     cleaned_state[k] = v
 
-            missing, unexpected = self._planner.load_state_dict(cleaned_state, strict=False)
+            # 4) 只保留 key 存在且 shape 一致的参数，过滤掉 gen_taus 这类不匹配的
+            current_state = self._planner.state_dict()
+            loadable_state: Dict[str, torch.Tensor] = {}
+            skipped = []
+
+            for k, v in cleaned_state.items():
+                if k not in current_state:
+                    skipped.append((k, v.shape, None))
+                    continue
+                if current_state[k].shape != v.shape:
+                    skipped.append((k, v.shape, current_state[k].shape))
+                    continue
+                loadable_state[k] = v
+
+            missing, unexpected = self._planner.load_state_dict(loadable_state, strict=False)
+
+            if skipped:
+                print("[MaskADPlanner] Skipped parameters due to shape mismatch:")
+                for k, s_old, s_new in skipped:
+                    print(f"  - {k}: ckpt {s_old}, current {s_new}")
+
             if missing:
-                print("[MaskADPlanner] Missing keys when loading state_dict:", missing)
+                print("[MaskADPlanner] Missing keys after loading:", missing)
             if unexpected:
-                print("[MaskADPlanner] Unexpected keys when loading state_dict:", unexpected)
+                print("[MaskADPlanner] Unexpected keys after loading:", unexpected)
 
             print(f"[MaskADPlanner] Loaded checkpoint from {self._ckpt_path}")
         else:
@@ -131,6 +155,7 @@ class MaskADPlanner(AbstractPlanner):
 
         self._planner = self._planner.to(self._device)
         self._planner.eval()
+
 
     # ------------------------------------------------------------------
     # nuPlan -> 我们模型输入
@@ -149,7 +174,7 @@ class MaskADPlanner(AbstractPlanner):
         #  'ego_current_state', 'agents_past', 'lanes', 'route_lanes',
         #  'static_objects', 以及为推理生成的 'neighbor_agents_future' 占位等（如果需要）。
         model_inputs = self.data_processor.observation_adapter(
-            history=history,
+            history_buffer=history,
             traffic_light_data=traffic_light_data,
             map_api=self._map_api,
             route_roadblock_ids=self._route_roadblock_ids,
@@ -176,7 +201,7 @@ class MaskADPlanner(AbstractPlanner):
         """
 
         # 只取 batch=0, agent=0 (ego) 的未来轨迹: [T, 4]
-        pred = outputs["prediction"][0, 0]  # [T, 4]
+        pred = outputs["prediction"][0, 0]  # [80, 4]
         pred_np = pred.detach().cpu().numpy().astype(np.float64)
 
         # 由 cos / sin 恢复 heading
@@ -210,11 +235,25 @@ class MaskADPlanner(AbstractPlanner):
         # 1. nuPlan → 模型输入
         inputs = self.planner_input_to_model_inputs(current_input)
 
+        # print("[MaskADPlanner] model inputs:")
+        # for k, v in inputs.items():
+        #     try:
+        #         if isinstance(v, torch.Tensor):
+        #             print(f"{k}: Tensor shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+        #         elif isinstance(v, np.ndarray):
+        #             print(f"{k}: ndarray shape={v.shape} dtype={v.dtype}")
+        #         else:
+        #             print(f"{k}: {type(v)} -> {v}")
+        #     except Exception as e:
+        #         print(f"{k}: (error printing) {e}")
+
         # 2. 前向推理（注意：MaskPlanner 里面已经自己做了 obs_normalizer）
         with torch.no_grad():
             outputs = self._planner.forward_inference(inputs)
 
         # 3. 模型输出转成 nuPlan 需要的 trajectory
         trajectory_states = self.outputs_to_trajectory(outputs, current_input.history.ego_states)
+
+        print
 
         return InterpolatedTrajectory(trajectory=trajectory_states)

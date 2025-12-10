@@ -5,7 +5,7 @@ setup(
     version="0.1.0",
     author="Tianle Liu",             # 比如 "Tianle Liu"
     author_email="liutianle@zju.edu.cn",  # 可选，可以先不写或者写个占位
-    description="Mask-based autonomous driving planner for nuPlan/Bench2Drive.",
+    description="Mask-based autonomous driving planner for nuPlan.",
     long_description="MaskAD: A mask-guided diffusion planner for autonomous driving.",
     long_description_content_type="text/plain",  # 如果用 README.md，可以用 "text/markdown"
     url="",
