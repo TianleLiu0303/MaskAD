@@ -5,7 +5,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*logs
+*.egg-info
 # ============================
 # VSCode / PyCharm
 # ============================
@@ -24,9 +24,6 @@ events.out.tfevents.*
 # ============================
 # NuPlan / Waymo data
 # ============================
-data/
-data_nuplan/
-data_waymo/
 *.npz
 *.pkl
 *.tfrecord
@@ -36,10 +33,6 @@ data_waymo/
 # ============================
 *.cache
 .cache/
-output/
-outputs/
-results/
-runs/
 
 # ============================
 # Environment files

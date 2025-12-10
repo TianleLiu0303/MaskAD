@@ -1,9 +1,9 @@
 maskplanner:
-  _target_: MaskAD.planner.planner.MaskADPlanner
+  _target_: MaskAD.planner.MaskADPlanner
   _convert_: "all"
 
   config:
-    _target_: MaskAD.planner.config.config.Config
+    _target_: MaskAD.utils.config.Config
     _convert_: "all"
 
     args_file: ???

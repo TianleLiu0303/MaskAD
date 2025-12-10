@@ -18,9 +18,9 @@ from MaskAD.GRPO.utils import (
     extract,
     make_timesteps,
     build_physical_states_from_future,
-    compute_grpo_trajectory_reward,
     compute_total_grad_norm,
 )
+from MaskAD.GRPO.rewards.nuplan_metric import compute_grpo_trajectory_reward
 
 
 # =========================
@@ -321,9 +321,10 @@ class MaskPlannerGRPO(MaskPlanner):
         # Reward & Advantage
         rewards_GB = compute_grpo_trajectory_reward(
             final_states5_GB,
-            actions=None,
+            batch=batch,
             v_target=5.0,
-            collision_dist=2.0,
+            collision_dist_margin=0.5,
+            dt = 0.4,
         )  # [G,B]
 
         rewards = rewards_GB.permute(1, 0).contiguous()  # [B,G]
@@ -425,7 +426,7 @@ def test_grpo():
     - 前向跑一次 forward_grpo_diffusion
     - backward，看梯度是否正常
     """
-    cfg_path = Path(__file__).resolve().parents[1] / "config" / "nuplan.yaml"
+    cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/nuplan.yaml"
     config = load_config_from_yaml(cfg_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
