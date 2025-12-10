@@ -96,7 +96,7 @@ class MaskPlanner(pl.LightningModule):
         super().__init__()
 
         self.cfg = config
-        # self.save_hyperparameters(self.cfg)
+        self.save_hyperparameters(self.cfg)
         self.encoder = Diffusion_Encoder(config)
         self.decoder = Diffusion_Decoder(config)
         # self.sampler = DDPM_Sampler(config)
@@ -452,15 +452,11 @@ class MaskPlanner(pl.LightningModule):
  
 ######################test##############################
 
-def load_config_from_yaml(cfg_path):
-    """
-    Load a config YAML file into a SimpleNamespace for attribute-style access.
-    """
-    cfg_path = Path(cfg_path)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+from omegaconf import OmegaConf
 
-    return SimpleNamespace(**data)
+def load_config_from_yaml(cfg_path):
+    cfg = OmegaConf.load(cfg_path)
+    return cfg
 
 def inspect_gradients(model):
     """

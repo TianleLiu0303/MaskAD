@@ -1,20 +1,16 @@
 import math
 from pathlib import Path
 from types import SimpleNamespace
-
+from typing import Optional, Dict
 import torch
 import yaml
 
 
-def load_config_from_yaml(cfg_path):
-    """
-    Load a config YAML file into a SimpleNamespace for attribute-style access.
-    """
-    cfg_path = Path(cfg_path)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+from omegaconf import OmegaConf
 
-    return SimpleNamespace(**data)
+def load_config_from_yaml(cfg_path):
+    cfg = OmegaConf.load(cfg_path)
+    return cfg
 
 
 def inspect_gradients(model):
@@ -92,93 +88,228 @@ def build_physical_states_from_future(
     states5 = torch.stack([x, y, theta, vx, vy], dim=-1)  # [B*G,P,T,5]
     return states5
 
-
 def compute_grpo_trajectory_reward(
-    trajectories,  # [G,B,N,T,5]
-    actions=None,
-    v_target=5.0,
-    collision_dist=2.0,
-    weights=None,
+    trajectories: torch.Tensor,   # [G,B,N,T,5] -> [x, y, theta, vx, vy]
+    batch: dict,
+    v_target: float = 5.0,
+    collision_dist: float = 2.0,
+    weights: Optional[Dict] = None,
+    dt: float = 0.1,              # 未来轨迹采样间隔
 ):
     """
-    GRPO 用的轨迹奖励函数，基本沿用你 DPR 的设计：
-      - 平滑性 (加速度平滑)
-      - 速度和目标速度的偏差
-      - 航向角变化
-      - 碰撞惩罚（基于 agent 之间最小距离）
-      - 动作惩罚（如果传入 actions）
+    NuPlan-style 简化 reward 组合：
+    1) progress_ratio: 预测 ego / expert 的进度比   (Ego progress along expert route ratio)
+    2) comfort_score: 参考 nuPlan comfort 阈值的舒适性
+    3) speed_limit_reward: 近似 Speed limit compliance
+    4) collision_penalty: 基于最小距离的碰撞 proxy (No at-fault collision 近似)
+
+    返回:
+    total_reward: [G,B]
     """
     G, B, N, T, D = trajectories.shape
-    assert D == 5, "Each state must be [x, y, theta, v_x, v_y]"
+    assert D == 5, "Expect state dim=5: [x, y, theta, vx, vy]"
+    device = trajectories.device
 
     if weights is None:
         weights = {
-            "smoothness": 1.0,
-            "speed": 1.0,
-            "orientation": 1.0,
-            "collision": 2.0,
-            "action_accel": 1.0,
-            "action_yaw": 1.0,
+            "progress": 1.0,
+            "comfort":  1.0,
+            "speed_limit": 0.5,
+            "collision":  5.0,
         }
 
-    x, y, theta, v_x, v_y = (
-        trajectories[..., 0],
-        trajectories[..., 1],
-        trajectories[..., 2],
-        trajectories[..., 3],
-        trajectories[..., 4],
-    )
-    v = torch.sqrt(v_x**2 + v_y**2)
+    # ------------------------------------------------
+    # 0. 取预测 ego 轨迹 [G,B,T,5]
+    # ------------------------------------------------
+    ego = trajectories[:, :, 0]  # [G,B,T,5]
+    x = ego[..., 0]
+    y = ego[..., 1]
+    theta = ego[..., 2]
+    vx = ego[..., 3]
+    vy = ego[..., 4]
+    speed = torch.sqrt(vx ** 2 + vy ** 2 + 1e-6)   # [G,B,T]
 
-    # 平滑性: 加速度平方
-    acc = v[..., 1:] - v[..., :-1]
-    smoothness_reward = -torch.mean(acc**2, dim=(2, 3))  # [G,B]
+    # =====================================================
+    # 1) Progress ratio: 预测 ego vs expert (nuPlan 风格)
+    # =====================================================
+    # expert future: [B, T, 3] (x, y, heading)
+    expert_future = batch.get("ego_agent_future", None)   # [B,T,3]
+    if expert_future is not None:
+        exp_x = expert_future[..., 0].to(device)          # [B,T]
+        exp_y = expert_future[..., 1].to(device)
 
-    # 速度偏差
-    speed_diff = (v - v_target) ** 2
-    speed_reward = -torch.mean(speed_diff, dim=(2, 3))   # [G,B]
+        # expert 总进度
+        exp_dx = exp_x[:, 1:] - exp_x[:, :-1]             # [B,T-1]
+        exp_dy = exp_y[:, 1:] - exp_y[:, :-1]
+        exp_step_dist = torch.sqrt(exp_dx ** 2 + exp_dy ** 2 + 1e-6)  # [B,T-1]
+        exp_progress = exp_step_dist.sum(dim=-1)          # [B]
 
-    # 朝向变化
-    d_theta = theta[..., 1:] - theta[..., :-1]
-    orientation_reward = -torch.mean(d_theta**2, dim=(2, 3))  # [G,B]
+        # ego 总进度（对 G 维 broadcast）
+        ego_dx = x[..., 1:] - x[..., :-1]                 # [G,B,T-1]
+        ego_dy = y[..., 1:] - y[..., :-1]
+        ego_step_dist = torch.sqrt(ego_dx ** 2 + ego_dy ** 2 + 1e-6)  # [G,B,T-1]
+        ego_progress = ego_step_dist.sum(dim=-1)          # [G,B]
 
-    # 碰撞：基于同一时间下 agent 之间的最小距离
-    pos = torch.stack([x, y], dim=-1)   # [G,B,N,T,2]
-    collision_penalty = torch.zeros(G, B, device=trajectories.device)
-    for g in range(G):
-        for b in range(B):
-            min_dist = []
-            for t in range(T):
-                dist = torch.cdist(pos[g, b, :, t], pos[g, b, :, t], p=2)
-                mask = ~torch.eye(N, dtype=torch.bool, device=trajectories.device)
-                min_d = dist[mask].min()
-                min_dist.append(min_d)
-            min_dist = torch.stack(min_dist)
-            penalty = torch.mean((collision_dist - min_dist).clamp(min=0.0) ** 2)
-            collision_penalty[g, b] = penalty
+        # 防止 expert_progress 接近 0
+        exp_progress_clamped = exp_progress.clamp(min=0.1)    # [B]
+        exp_progress_clamped = exp_progress_clamped.unsqueeze(0).expand(G, B)  # [G,B]
 
-    # 动作惩罚（如果有 actions）
-    if actions is not None:
-        G2, B2, N2, A2, D2 = actions.shape
-        assert (G2, B2, N2) == (G, B, N), "Action tensor shape mismatch"
-        accel = actions[..., 0]
-        yaw_rate = actions[..., 1]
-        accel_penalty = -torch.mean(accel**2, dim=(2, 3))
-        yaw_penalty = -torch.mean(yaw_rate**2, dim=(2, 3))
+        progress_ratio = (ego_progress / exp_progress_clamped).clamp(0.0, 1.0)  # [G,B]
+
+        # nuPlan 里还有一个 min_progress_threshold=0.2，可以近似为：
+        progress_ok = (progress_ratio >= 0.2).float()
+        # 这里直接用 progress_ratio，当它 <0.2 时也会惩罚
+        progress_reward = progress_ratio
     else:
-        accel_penalty = torch.zeros(G, B, device=trajectories.device)
-        yaw_penalty = torch.zeros(G, B, device=trajectories.device)
+        # 没有 expert future，就退化成总路程长度的 log
+        dx = x[..., 1:] - x[..., :-1]
+        dy = y[..., 1:] - y[..., :-1]
+        step_dist = torch.sqrt(dx ** 2 + dy ** 2 + 1e-6)
+        progress = step_dist.sum(dim=-1)          # [G,B]
+        progress_reward = torch.log1p(progress)   # [G,B]
 
+    # =====================================================
+    # 2) Comfort: 用 nuPlan 的阈值来算舒适比例 (0~1)
+    # =====================================================
+    # 车体坐标系: fwd = (cosθ, sinθ), right = (-sinθ, cosθ)
+    cos_h = torch.cos(theta)
+    sin_h = torch.sin(theta)
+    fwd_x = cos_h
+    fwd_y = sin_h
+    right_x = -sin_h
+    right_y = cos_h
+
+    # 速度差分 → 加速度
+    ax = (vx[..., 1:] - vx[..., :-1]) / dt       # [G,B,T-1]
+    ay = (vy[..., 1:] - vy[..., :-1]) / dt
+
+    # 与 time 对齐
+    fwd_x_c = fwd_x[..., 1:]
+    fwd_y_c = fwd_y[..., 1:]
+    right_x_c = right_x[..., 1:]
+    right_y_c = right_y[..., 1:]
+
+    a_lon = ax * fwd_x_c + ay * fwd_y_c         # [G,B,T-1]
+    a_lat = ax * right_x_c + ay * right_y_c     # [G,B,T-1]
+
+    # jerk
+    j_lon = (a_lon[..., 1:] - a_lon[..., :-1]) / dt   # [G,B,T-2]
+    j_lat = (a_lat[..., 1:] - a_lat[..., :-1]) / dt
+
+    # yaw_rate / yaw_acc
+    yaw = theta
+    yaw_rate = (yaw[..., 1:] - yaw[..., :-1]) / dt         # [G,B,T-1]
+    yaw_acc = (yaw_rate[..., 1:] - yaw_rate[..., :-1]) / dt  # [G,B,T-2]
+
+    # nuPlan comfort 的默认阈值
+    min_lon_accel = -4.05
+    max_lon_accel = 2.40
+    max_abs_lat_accel = 4.89
+    max_abs_yaw_accel = 1.93
+    max_abs_yaw_rate = 0.95
+    max_abs_lon_jerk = 4.13
+    max_abs_mag_jerk = 8.37
+
+    def within_bounds(x, lo=None, hi=None):
+        if lo is None:
+            lo = -1e9
+        if hi is None:
+            hi = 1e9
+        return ((x >= lo) & (x <= hi)).float()
+
+    ok_lon_acc = within_bounds(a_lon, min_lon_accel, max_lon_accel)          # [G,B,T-1]
+    ok_lat_acc = within_bounds(a_lat, -max_abs_lat_accel, max_abs_lat_accel)
+
+    # jerk 限制
+    mag_jerk = torch.sqrt(j_lon ** 2 + j_lat ** 2 + 1e-6)                    # [G,B,T-2]
+    ok_lon_jerk = within_bounds(j_lon, -max_abs_lon_jerk, max_abs_lon_jerk)  # [G,B,T-2]
+    ok_mag_jerk = within_bounds(mag_jerk, -max_abs_mag_jerk, max_abs_mag_jerk)
+
+    # yaw 限制
+    ok_yaw_rate = within_bounds(yaw_rate, -max_abs_yaw_rate, max_abs_yaw_rate)
+    ok_yaw_acc = within_bounds(yaw_acc, -max_abs_yaw_accel, max_abs_yaw_accel)
+
+    # 各个 time 维度做平均，得到 0~1 的得分
+    comfort_terms = []
+
+    comfort_terms.append(ok_lon_acc.mean(dim=-1))   # [G,B]
+    comfort_terms.append(ok_lat_acc.mean(dim=-1))
+    comfort_terms.append(ok_yaw_rate.mean(dim=-1))
+
+    if ok_lon_jerk.numel() > 0:
+        comfort_terms.append(ok_lon_jerk.mean(dim=-1))
+    if ok_mag_jerk.numel() > 0:
+        comfort_terms.append(ok_mag_jerk.mean(dim=-1))
+    if ok_yaw_acc.numel() > 0:
+        comfort_terms.append(ok_yaw_acc.mean(dim=-1))
+
+    comfort_score = torch.stack(comfort_terms, dim=-1).mean(dim=-1)  # [G,B], 0~1
+
+    comfort_reward = comfort_score   # 直接当正向 reward
+
+    # =====================================================
+    # 3) Speed limit compliance (粗略版)
+    # =====================================================
+    route_speed_limit = batch.get("route_lanes_speed_limit", None)        # [B,25,1]
+    route_has_speed_limit = batch.get("route_lanes_has_speed_limit", None)  # [B,25,1]
+
+    if route_speed_limit is not None and route_has_speed_limit is not None:
+        sl = route_speed_limit.squeeze(-1).to(device)          # [B,25]
+        mask = route_has_speed_limit.squeeze(-1).to(device)    # [B,25] bool
+        # 只用有 speed_limit 的路段
+        valid_sl = torch.where(mask, sl, torch.zeros_like(sl)) # [B,25]
+        # 避免全 0 的情况：如果全是 0，就用 v_target 当限速
+        scenario_sl = valid_sl.sum(dim=-1) / (mask.sum(dim=-1).clamp(min=1))  # [B]
+        scenario_sl = torch.where(mask.sum(dim=-1) > 0,
+                                scenario_sl,
+                                torch.full_like(scenario_sl, v_target))
+        # broadcast 到 [G,B,1]
+        scenario_sl = scenario_sl.unsqueeze(0).unsqueeze(-1).expand(G, B, T)
+
+        # overspeed > 0 时认为超速
+        overspeed = (speed - scenario_sl).clamp(min=0.0)   # [G,B,T]
+        # 可视为“超速时间比例”的一个 proxy
+        overspeed_flag = (overspeed > 0.1).float()         # [G,B,T]
+        overspeed_ratio = overspeed_flag.mean(dim=-1)      # [G,B] in [0,1]
+
+        # reward：没有超速时 ≈ 0，一旦超速就负数
+        speed_limit_reward = -overspeed_ratio
+    else:
+        speed_limit_reward = torch.zeros(G, B, device=device)
+
+    # =====================================================
+    # 4) Collision proxy: 同一时间步 agent 之间距离过近
+    # =====================================================
+    pos = trajectories[..., :2]  # [G,B,N,T,2]
+    collision_penalty = torch.zeros(G, B, device=device)
+
+    if N > 1:
+        for g in range(G):
+            for b in range(B):
+                pos_gb = pos[g, b]  # [N,T,2]
+                min_d_list = []
+                for t in range(T):
+                    d = torch.cdist(pos_gb[:, t], pos_gb[:, t], p=2)  # [N,N]
+                    mask = ~torch.eye(N, dtype=torch.bool, device=device)
+                    min_d = d[mask].min()
+                    min_d_list.append(min_d)
+                min_dists = torch.stack(min_d_list)  # [T]
+                # 小于 collision_dist 的部分给二次惩罚
+                penalty = ((collision_dist - min_dists).clamp(min=0.0) ** 2).mean()
+                collision_penalty[g, b] = penalty
+
+    # =====================================================
+    # 5) 融合整体 reward
+    # =====================================================
     total_reward = (
-        weights["smoothness"] * smoothness_reward
-        + weights["speed"] * speed_reward
-        + weights["orientation"] * orientation_reward
-        - weights["collision"] * collision_penalty
-        + weights["action_accel"] * accel_penalty
-        + weights["action_yaw"] * yaw_penalty
-    )
+        weights["progress"]    * progress_reward +
+        weights["comfort"]     * comfort_reward  +
+        weights["speed_limit"] * speed_limit_reward -
+        weights["collision"]   * collision_penalty
+    )  # [G,B]
 
-    return total_reward  # [G,B]
+    return total_reward
+
 
 
 def compute_total_grad_norm(model) -> float:

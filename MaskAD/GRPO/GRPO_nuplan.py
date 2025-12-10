@@ -321,7 +321,7 @@ class MaskPlannerGRPO(MaskPlanner):
         # Reward & Advantage
         rewards_GB = compute_grpo_trajectory_reward(
             final_states5_GB,
-            actions=None,
+            batch=batch,
             v_target=5.0,
             collision_dist=2.0,
         )  # [G,B]
@@ -425,7 +425,7 @@ def test_grpo():
     - 前向跑一次 forward_grpo_diffusion
     - backward，看梯度是否正常
     """
-    cfg_path = Path(__file__).resolve().parents[1] / "config" / "nuplan.yaml"
+    cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/nuplan.yaml"
     config = load_config_from_yaml(cfg_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
