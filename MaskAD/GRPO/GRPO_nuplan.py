@@ -4,13 +4,12 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import lightning.pytorch as pl
 from torch.distributions import Normal
 
 from MaskAD.model.maskplanner import MaskPlanner
 
-# === 新增：从 utils 中引入通用函数 ===
+# === 通用工具函数 & reward ===
 from MaskAD.GRPO.utils import (
     load_config_from_yaml,
     inspect_gradients,
@@ -21,19 +20,22 @@ from MaskAD.GRPO.utils import (
     compute_total_grad_norm,
 )
 from MaskAD.GRPO.rewards.nuplan_metric import compute_grpo_trajectory_reward
+from MaskAD.GRPO.rewards.other_metric import compute_grpo_custom_trajectory_reward
 
 
-# =========================
-# GRPO + BC Loss 微调版
-# =========================
 class MaskPlannerGRPO(MaskPlanner):
     """
-    基于 MaskPlanner 的第二阶段：用 GRPO + BC loss 微调 decoder (DiT)
-    只更新 decoder，encoder 与 mask_net 冻结。
+    基于 MaskPlanner 的第二阶段：用 Diffusion-GRPO + BC loss 微调 decoder (DiT)。
+
+    - encoder & mask_net 全部冻结，只更新 decoder。
+    - policy loss 中用 mask 对 (agent,time) 做加权：高 mask => 强 RL。
+    - BC loss 中用 (1 - mask) 加权：低 mask => 强 imitation。
     """
+
     def __init__(self, config):
         super().__init__(config)
         self.save_hyperparameters(config)
+
         self._future_len = config.future_len
         self._agents_len = 1 + config.predicted_neighbor_num
         self._diffusion_steps = config.diffusion_steps
@@ -76,17 +78,9 @@ class MaskPlannerGRPO(MaskPlanner):
         # ========= 初始化 DDPM 系数 =========
         self._init_ddpm_for_grpo(self._diffusion_steps)
 
-    def on_train_epoch_end(self):
-        """
-        每个 epoch 结束后，把当前 decoder 的参数拷贝给 old_decoder。
-        如果你想 teacher 固定为第一阶段 BC 模型，可以注释掉这一步。
-        """
-        self.old_decoder.load_state_dict(copy.deepcopy(self.decoder.state_dict()))
-        self.old_decoder.eval()
-        for p in self.old_decoder.parameters():
-            p.requires_grad = False
-
-    # ----------------- DDPM schedule & 系数 -----------------
+    # ======================================================
+    # DDPM 相关
+    # ======================================================
     def _init_ddpm_for_grpo(self, num_train_timesteps: int):
         betas = cosine_beta_schedule(num_train_timesteps)
         self.register_buffer("ddpm_betas", betas)
@@ -119,7 +113,19 @@ class MaskPlannerGRPO(MaskPlanner):
         self.register_buffer("ddpm_mu_coef1", mu_coef1)
         self.register_buffer("ddpm_mu_coef2", mu_coef2)
 
-    # ----------------- p(x_{t-1}|x_t) 单步 -----------------
+    def on_train_epoch_end(self):
+        """
+        每个 epoch 结束后，把当前 decoder 的参数拷贝给 old_decoder。
+        如果你想 teacher 固定为第一阶段 BC 模型，可以注释掉这一步。
+        """
+        self.old_decoder.load_state_dict(copy.deepcopy(self.decoder.state_dict()))
+        self.old_decoder.eval()
+        for p in self.old_decoder.parameters():
+            p.requires_grad = False
+
+    # ======================================================
+    # 单步 p(x_{t-1} | x_t, cond)
+    # ======================================================
     def p_mean_variance_step(
         self,
         x_t_future: torch.Tensor,          # [B',P,T,4] (normalized future)
@@ -138,7 +144,7 @@ class MaskPlannerGRPO(MaskPlanner):
             [current_states_rep[:, :, None, :], x_t_future], dim=2
         )  # [B',P,1+T,4]
 
-        # 这里的 diffusion_time 与你一阶段训练中的定义保持一致
+        # diffusion_time 与一阶段训练保持一致
         diffusion_time = (t.float() + 1.0) / float(self._diffusion_steps)   # [B']
         merged_inputs = {
             **batch_rep,
@@ -158,7 +164,9 @@ class MaskPlannerGRPO(MaskPlanner):
 
         return mean, logvar, x0_future
 
-    # ----------------- 采样反向链 x_T → x_0 -----------------
+    # ======================================================
+    # 采样反向链 x_T → x_0
+    # ======================================================
     @torch.no_grad()
     def sample_chain_grpo(
         self,
@@ -221,7 +229,9 @@ class MaskPlannerGRPO(MaskPlanner):
 
         return chains, final_future_norm
 
-    # ----------------- 整条链的 log p(x_{t-1}|x_t) -----------------
+    # ======================================================
+    # 整条链的 log p(x_{t-1}|x_t)
+    # ======================================================
     def get_logprobs_chain(
         self,
         encoder_outputs_rep: dict,
@@ -265,8 +275,15 @@ class MaskPlannerGRPO(MaskPlanner):
         log_probs_flat = log_probs.view(-1, P, T, D)   # [B*G*K,P,T,4]
         return log_probs_flat
 
-    # ----------------- GRPO 主逻辑 + BC Loss -----------------
+    # ======================================================
+    # GRPO + BC（含 mask 加权）
+    # ======================================================
     def forward_grpo_diffusion(self, batch: dict, deterministic: bool = False):
+        """
+        - 采样 G 条链，计算 reward → advantage
+        - policy loss: 对链上 step 做 γ^t * A 加权，对 (agent,time) 用 mask 加权
+        - BC loss: 用 old_decoder 生成 teacher 链，对 (agent,time) 用 (1-mask) 加权
+        """
         encoder_outputs = self.encoder(batch)
         B = batch["ego_current_state"].shape[0]
         Pn = self.cfg.predicted_neighbor_num
@@ -278,7 +295,7 @@ class MaskPlannerGRPO(MaskPlanner):
         neighbors_current = batch["agents_past"][:, 1:Pn+1, -1, :4]    # [B,Pn,4]
         current_states = torch.cat([ego_current, neighbors_current], dim=1)  # [B,P,4]
 
-        # mask 网络（GRPO 中保留，但 encoder & mask_net 已冻结）
+        # ---- mask: [B,P,T] ----
         mask, mask_emb = self.mask_net(
             encoder_outputs["encoding"],
             encoder_outputs["encoding_agents"],
@@ -318,13 +335,11 @@ class MaskPlannerGRPO(MaskPlanner):
             .contiguous()
         )  # [G,B,P,T,5]
 
-        # Reward & Advantage
-        rewards_GB = compute_grpo_trajectory_reward(
+        # ---------- Reward & Advantage ----------
+        rewards_GB = compute_grpo_custom_trajectory_reward(
             final_states5_GB,
             batch=batch,
             v_target=5.0,
-            collision_dist_margin=0.5,
-            dt = 0.4,
         )  # [G,B]
 
         rewards = rewards_GB.permute(1, 0).contiguous()  # [B,G]
@@ -337,19 +352,11 @@ class MaskPlannerGRPO(MaskPlanner):
         adv_max = torch.quantile(advantages, self.clip_advantage_upper_quantile)
         advantages = advantages.clamp(adv_min, adv_max)  # [B*G]
 
-        num_denoising_steps = chains.shape[1] - 1
-        step_idx = torch.arange(num_denoising_steps, device=device)
-        discount = self.gamma_denoising ** (num_denoising_steps - step_idx - 1)
+        num_denoising_steps = chains.shape[1] - 1   # K
+        K = num_denoising_steps
+        BG = B * G
 
-        adv_steps = (
-            advantages.view(B, G, 1).expand(B, G, num_denoising_steps)
-        )  # [B,G,K]
-        discount = (
-            discount.view(1, 1, num_denoising_steps).expand(B, G, num_denoising_steps)
-        )
-        adv_weighted_flat = (adv_steps * discount).reshape(-1)  # [B*G*K]
-
-        # 当前策略 logprob 链
+        # ---------- policy: log πθ(x_{t-1}|x_t) + mask 加权 ----------
         log_probs_flat = self.get_logprobs_chain(
             encoder_outputs_rep,
             batch_rep,
@@ -357,14 +364,40 @@ class MaskPlannerGRPO(MaskPlanner):
             chains,
             decoder=self.decoder,
         )  # [B*G*K,P,T,4]
-        log_probs = log_probs_flat.clamp(min=-5, max=2).mean(dim=[1, 2, 3])  # [B*G*K]
 
-        policy_loss = -(log_probs * adv_weighted_flat).mean()
+        # mask_rl = mask (高 mask → 强 RL)
+        # mask: [B,P,T] → [B*G,P,T]
+        mask_rep_BG = mask.repeat_interleave(G, dim=0)  # [B*G,P,T]
+        eps_w = 1e-6
+
+        # 展开到 [B*G,K,P,T]
+        mask_rl_BGK = mask_rep_BG[:, None, :, :].expand(-1, K, -1, -1)
+        mask_rl_flat = mask_rl_BGK.reshape(BG * K, P, self._future_len)  # [B*G*K,P,T]
+
+        # 对 (P,T,4) 做加权平均：sum(m * logp) / (sum(m) * 4)
+        log_probs_weighted = (
+            log_probs_flat.clamp(min=-5, max=2) * mask_rl_flat.unsqueeze(-1)
+        )  # [BGK,P,T,4]
+        numel_rl = mask_rl_flat.sum(dim=[1, 2]) * 4.0 + eps_w
+        log_probs_step = log_probs_weighted.sum(dim=[1, 2, 3]) / numel_rl  # [BGK]
+
+        # 变回 [B,G,K]
+        log_probs_step = log_probs_step.view(B, G, K)   # log πθ(x_{t-1}|x_t)
+
+        # advantage 展成 [B,G,K]
+        adv_steps = advantages.view(B, G, 1).expand(B, G, K)  # [B,G,K]
+
+        # 时间折扣 γ^{t-1}
+        t_idx = torch.arange(K, device=device)  # [0..K-1]
+        discount = (self.gamma_denoising ** t_idx).view(1, 1, K)  # [1,1,K]
+
+        # Eq.(12) 中 L_RL：对 b,g,t 取平均
+        policy_loss = - (discount * log_probs_step * adv_steps).mean()
         total_loss = policy_loss
 
+        # ---------- BC: teacher 链 + (1-mask) 加权 ----------
         bc_loss = torch.tensor(0.0, device=device)
 
-        # BC Loss：teacher = old_decoder
         if self.use_bc_loss:
             with torch.no_grad():
                 teacher_chains, _ = self.sample_chain_grpo(
@@ -375,22 +408,31 @@ class MaskPlannerGRPO(MaskPlanner):
                     decoder=self.old_decoder,
                 )  # [B*G,K+1,P,T,4]
 
+            K_bc = teacher_chains.shape[1] - 1
+
             bc_logp_flat = self.get_logprobs_chain(
                 encoder_outputs_rep,
                 batch_rep,
                 current_states_rep,
                 teacher_chains,
                 decoder=self.decoder,
-            )  # [B*G*K,P,T,4]
+            )  # [B*G*K_bc,P,T,4]
 
-            K_steps = teacher_chains.shape[1] - 1
-            bc_logp = bc_logp_flat.clamp(min=-5, max=2)
-            bc_logp = bc_logp.view(
-                -1, K_steps, bc_logp.shape[1], bc_logp.shape[2], bc_logp.shape[3]
+            # mask_bc = 1 - mask（低 mask → imitation 强）
+            mask_bc_BG = (1.0 - mask_rep_BG)  # [B*G,P,T]
+            mask_bc_BGK = mask_bc_BG[:, None, :, :].expand(-1, K_bc, -1, -1)
+            mask_bc_flat = mask_bc_BGK.reshape(BG * K_bc, P, self._future_len)
+
+            bc_logp_weighted = (
+                bc_logp_flat.clamp(min=-5, max=2) * mask_bc_flat.unsqueeze(-1)
             )
-            bc_logp = bc_logp.mean(dim=[1, 2, 3, 4])  # [B*G]
+            numel_bc = mask_bc_flat.sum(dim=[1, 2]) * 4.0 + eps_w
+            bc_logp_step = bc_logp_weighted.sum(dim=[1, 2, 3]) / numel_bc  # [BG*K_bc]
 
-            bc_loss = -bc_logp.mean()
+            bc_logp_step = bc_logp_step.view(B, G, K_bc)  # [B,G,K_bc]
+
+            # L_BC：简单平均，不乘 A 和 γ
+            bc_loss = -bc_logp_step.mean()
             total_loss = total_loss + self.bc_coeff * bc_loss
 
         log_dict = {
@@ -402,17 +444,21 @@ class MaskPlannerGRPO(MaskPlanner):
 
         return total_loss, log_dict
 
-    # 重载 Lightning 的训练 / 验证，直接走 GRPO
+    # ======================================================
+    # Lightning 训练 / 验证
+    # ======================================================
     def training_step(self, batch, batch_idx):
         loss, log_dict = self.forward_grpo_diffusion(batch, deterministic=False)
         train_log = {f"train/{k}": v for k, v in log_dict.items()}
-        self.log_dict(train_log, on_step=True, on_epoch=False, sync_dist=True, prog_bar=True)
+        self.log_dict(train_log, on_step=True, on_epoch=False,
+                      sync_dist=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, log_dict = self.forward_grpo_diffusion(batch, deterministic=True)
         val_log = {f"val/{k}": v for k, v in log_dict.items()}
-        self.log_dict(val_log, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log_dict(val_log, on_step=False, on_epoch=True,
+                      sync_dist=True, prog_bar=True)
         return loss
 
 
@@ -450,6 +496,7 @@ def test_grpo():
         "route_lanes_speed_limit": torch.randn(batch_size, 25, 1).float(),
         "route_lanes_has_speed_limit": torch.randint(0, 2, (batch_size, 25, 1)).bool(),
 
+        # encoder 可能会用到，将来真训练时会换成真实数据
         "neighbor_agents_future": torch.randn(batch_size, 32, config.future_len, 3).float(),
         "ego_agent_future": torch.randn(batch_size, config.future_len, 3).float(),
     }
@@ -484,7 +531,7 @@ def test_grpo():
     for k, v in log_dict.items():
         print(f"{k}: {float(v.detach().cpu())}")
 
-    # 检查一下 mask_net 是否有梯度（应该都是 False）
+    # 检查一下 mask_net 是否有梯度（应为冻结）
     print("\n=== MaskNet 梯度检查（应为冻结） ===")
     for name, p in model.named_parameters():
         if "mask_net" in name:
