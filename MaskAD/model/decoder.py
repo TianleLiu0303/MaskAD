@@ -29,20 +29,16 @@ class Decoder(nn.Module):
             dropout=dpr,
         )
     def forward(self, encoder_outputs, inputs):
-        ego_current = inputs['ego_current_state'][:, None, :4]
-        neighbors_current = inputs["agents_past"][:, 1:, -1, :4]
-        neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0
-        inputs["neighbor_current_mask"] = neighbor_current_mask
-
-        current_states = torch.cat([ego_current, neighbors_current], dim=1) # [B, P, 4]
-
-        B, P, _ = current_states.shape
-        assert P == (1 + self._predicted_neighbor_num)
+        agents_history = inputs["agents_history"]  
+        mask_v = torch.sum(torch.ne(agents_history[..., :2], 0), dim=-1) == 0   # [B,P,V]
+        neighbor_current_mask = mask_v[:, :, -1]                                # [B,P]
+        inputs["neighbor_current_mask"] = neighbor_current_mask[:, 1:]
 
         ego_neighbor_encoding = encoder_outputs['encoding']
         route_lanes = inputs['route_lanes']
 
         mask_emb = encoder_outputs['mask_emb'] # [B, N, T, D_model]
+
         traj = inputs['sampled_trajectories']  
         # 拆开当前 + 未来
         traj_current = traj[:, :, :1, :]    # [B, P, 1, 4]
@@ -50,7 +46,7 @@ class Decoder(nn.Module):
 
         # 只对未来部分加 mask
         traj_future = traj_future + mask_emb
-
+        B,P, _, _ =  traj.shape
         # 再拼回去
         sampled_trajectories = torch.cat([traj_current, traj_future], dim=2)  # [B, P, 1+T, 4]
         sampled_trajectories = sampled_trajectories.reshape(B, P, -1)
@@ -63,7 +59,7 @@ class Decoder(nn.Module):
                     diffusion_time,
                     ego_neighbor_encoding,
                     route_lanes,
-                    neighbor_current_mask
+                    neighbor_current_mask[:,1:]
                 ).reshape(B, P, -1, 4)
         }
 
@@ -123,95 +119,197 @@ class DiT(nn.Module):
 
 
 class RouteEncoder(nn.Module):
-    def __init__(self, route_num, lane_len, drop_path_rate=0.3, hidden_dim=192, tokens_mlp_dim=33, channels_mlp_dim=64):
+    def __init__(
+        self,
+        route_num,
+        lane_len,
+        drop_path_rate=0.3,
+        hidden_dim=256,
+        tokens_mlp_dim=33,
+        channels_mlp_dim=64,
+        num_tl_states=9,      # traffic_light_state: 0..8
+        num_lane_types=20,    # lane_type: 0..19
+    ):
         super().__init__()
 
         self._channel = channels_mlp_dim
+        self.route_num = route_num
+        self.lane_len = lane_len
+        self.num_tl_states = num_tl_states
+        self.num_lane_types = num_lane_types
 
-        self.channel_pre_project = Mlp(in_features=4, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.)
-        self.token_pre_project = Mlp(in_features=route_num * lane_len, hidden_features=tokens_mlp_dim, out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.)
+        # 4 维几何特征: (x, y, cos(h), sin(h))
+        self.channel_pre_project = Mlp(
+            in_features=4,
+            hidden_features=channels_mlp_dim,
+            out_features=channels_mlp_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+
+        # 整个 route 视作一个序列，长度 = route_num * lane_len
+        self.token_pre_project = Mlp(
+            in_features=route_num * lane_len,
+            hidden_features=tokens_mlp_dim,
+            out_features=tokens_mlp_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+
+        # traffic light / lane type 嵌入
+        self.traffic_emb = nn.Embedding(num_tl_states, channels_mlp_dim)
+        self.lane_type_emb = nn.Embedding(num_lane_types, channels_mlp_dim)
 
         self.Mixer = MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate)
 
         self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
+        self.emb_project = Mlp(
+            in_features=channels_mlp_dim,
+            hidden_features=hidden_dim,
+            out_features=hidden_dim,
+            act_layer=nn.GELU,
+            drop=drop_path_rate,
+        )
 
     def forward(self, x):
-        '''
-        x: B, P, V, D
-        '''
-        # only x and x->x' vector, no boundary, no speed limit, no traffic light
-        x = x[..., :4]
+        """
+        x: [B, P, V, 5]
+           (...,0:5) = (x, y, heading, traffic_light_state, lane_type)
 
-        B, P, V, _ = x.shape
-        mask_v = torch.sum(torch.ne(x[..., :4], 0), dim=-1).to(x.device) == 0
-        mask_p = torch.sum(~mask_v, dim=-1) == 0
-        mask_b = torch.sum(~mask_p, dim=-1) == 0
-        x = x.view(B, P * V, -1)
+        返回:
+            route_feat: [B, hidden_dim]   每个场景一个 navigation 向量
+        """
+        B, P, V, D = x.shape
 
-        valid_indices = ~mask_b.view(-1) 
-        x = x[valid_indices] 
+        # ---- 1. 几何 + 语义分解 ----
+        coords = x[..., 0:2]          # [B,P,V,2]
+        heading = x[..., 2]           # [B,P,V]
+        tl_state = x[..., 3].long()   # [B,P,V]
+        lane_type = x[..., 4].long()  # [B,P,V]
 
-        x = self.channel_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.Mixer(x)
+        # 几何特征: (x, y, cos(h), sin(h))
+        cos_h = torch.cos(heading)
+        sin_h = torch.sin(heading)
+        geom = torch.cat(
+            [coords, cos_h.unsqueeze(-1), sin_h.unsqueeze(-1)],
+            dim=-1
+        )                              # [B,P,V,4]
 
-        x = torch.mean(x, dim=1)
+        # ---- 2. mask：全 0 视为 padding route ----
+        # 这里对 geom 判断是否全 0，当一个场景所有 route 都是 0 时，认为该 batch 无效
+        mask_v = torch.sum(torch.ne(geom, 0.0), dim=-1) == 0     # [B,P,V]
+        mask_b = torch.sum(~mask_v.view(B, -1), dim=-1) == 0     # [B] 每个场景是否“全 padding”
 
-        x = self.emb_project(self.norm(x))
+        # ---- 3. 展平成一个长序列: B, (P*V), 4 ----
+        geom = geom.view(B, P * V, 4)
+        tl_state = tl_state.view(B, P * V)
+        lane_type = lane_type.view(B, P * V)
 
-        x_result = torch.zeros((B, x.shape[-1]), device=x.device)
-        x_result[valid_indices] = x  # Fill in valid parts
-        
-        return x_result.view(B, -1)
+        valid_indices = ~mask_b     # [B]
+        geom = geom[valid_indices]  # [B_valid, P*V, 4]
+        tl_state = tl_state[valid_indices]
+        lane_type = lane_type[valid_indices]
+
+        # ---- 4. 通道投影 + 语义 embedding ----
+        x_feat = self.channel_pre_project(geom)        # [B_valid, P*V, C]
+
+        # clamp 防止越界
+        tl_state = torch.clamp(tl_state, 0, self.num_tl_states - 1)
+        lane_type = torch.clamp(lane_type, 0, self.num_lane_types - 1)
+
+        tl_emb = self.traffic_emb(tl_state)            # [B_valid, P*V, C]
+        lane_emb = self.lane_type_emb(lane_type)       # [B_valid, P*V, C]
+
+        x_feat = x_feat + tl_emb + lane_emb            # [B_valid, P*V, C]
+
+        # ---- 5. token 维度 Mixer ----
+        # 现在视为 [B_valid, C, N_token]，N_token = P*V
+        x_feat = x_feat.permute(0, 2, 1)               # [B_valid, C, P*V]
+        x_feat = self.token_pre_project(x_feat)        # [B_valid, tokens_mlp_dim, C]
+        x_feat = x_feat.permute(0, 2, 1)               # [B_valid, C, tokens_mlp_dim]
+
+        x_feat = self.Mixer(x_feat)                    # [B_valid, tokens_mlp_dim, C]
+
+        # 沿着 token 维度做 average pooling
+        x_feat = torch.mean(x_feat, dim=1)             # [B_valid, C]
+
+        # ---- 6. 最终投影到 hidden_dim ----
+        x_feat = self.emb_project(self.norm(x_feat))    # [B_valid, hidden_dim]
+
+        # ---- 7. 回填到 B 个场景 ----
+        out = x.new_zeros(B, x_feat.shape[-1])
+        out[valid_indices] = x_feat                    # [B, hidden_dim]
+
+        return out
+
 
 
 
 ###############  test #####################
 def main():
-    # ========= 1. 构造一个假的 config =========
-    class Config:
-        pass
+    from types import SimpleNamespace
 
-    config = Config()
+    # ===== 1. 配一个简单的 config =====
+    config = SimpleNamespace()
+    config.hidden_dim = 256
+
+    config.agent_num = 64               # neighbor_agents_past 里 P 的大小
+    config.static_objects_num = 16
+    config.lane_num = 256
+    config.predicted_neighbor_num = 63
+
+    config.static_objects_dim = 3
+
+    config.past_len = 11              # AgentFusionEncoder: time_len
+    config.lane_len = 30               # LaneFusionEncoder: lane_len
+    config.future_len = 80
+
+    config.encoder_drop_path_rate = 0.1
+    config.encoder_depth = 2
+    config.encoder_tokens_mlp_dim = 64
+    config.encoder_channels_mlp_dim = 128
+
+    config.encoder_dim_head = 64
+    config.encoder_num_heads = 4
+    config.enable_encoder_attn_dist = True
+    config.encoder_attn_dropout = 0.1
+
     config.decoder_drop_path_rate = 0.1
     config.encoder_drop_path_rate = 0.1
     config.hidden_dim = 256
     config.num_heads = 4
-
-    config.predicted_neighbor_num = 32      # P = 1(ego) + 31 = 32
-    config.future_len = 40                  # 未来 40 帧 -> (40 + 1) * 4 维度
+    config.future_len = 80                  # 未来 40 帧 -> (40 + 1) * 4 维度
     config.route_num = 16                   # 对应 P
     config.lane_len = 64                    # 对应 V
     config.decoder_depth = 1          # DiTBlock 层数
+    # ===== 2. 构造随机输入 =====
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ========= 2. 构造 Decoder =========
-    decoder = Decoder(config).to(device)
-    decoder.eval()
-
-    # ========= 3. 构造假输入数据 =========
-    B = 2  # batch size
+    B = 2
     P = 1 + config.predicted_neighbor_num  # 33
     V = config.lane_len                   # 64
-    D_route = 4                           # route_lanes 的最后维度至少 4（你前面只用到 :4）
+    D_route = 4  
+    N_agents = config.agent_num
+    N_static = config.static_objects_num
+    N_lanes = config.lane_num
+    T_hist = config.past_len
+    lane_len = config.lane_len
 
-    # ego 当前状态: [B, 4]
-    ego_current_state = torch.randn(B, 4, device=device)
+    # neighbor_agents_past: (x, y, cos, sin, vx, vy, w, l, type(3)) → D = 11
+    agents_history = torch.randn(B, N_agents, T_hist,8, device=device)
 
-    # neighbor 过去轨迹: [B, P-1, T_past, 4]
-    T_past = 20
-    neighbor_agents_past = torch.randn(B, P - 1, T_past, 4, device=device)
+    # static_objects: (x, y, cos, sin, w, l, type(4)) → D = 10
+    traffic_light_points = torch.randn(B, N_static, 3, device=device)
 
-    # route_lanes: [B, P, V, D_route]
-    route_lanes = torch.randn(B, 16, V, D_route, device=device)
+    # lanes: (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4)) → D = 12
+    polylines = torch.randn(B, N_lanes, lane_len, 5, device=device)
 
-    # sampled_trajectories: [B, P, (future_len + 1) * 4]
+    agents_type = torch.randint(0, 4, (B, N_agents), device=device)
+
+    route_lanes = torch.randn(B, 16, lane_len, 5, device=device)
+
     sampled_trajectories = torch.randn(
-        B, P, config.future_len  * 3,
+        B, P, (config.future_len+1), 4,
         device=device
     )
 
@@ -220,23 +318,23 @@ def main():
         low=0, high=1000, size=(B,), device=device
     ).float()
 
-    # encoder_outputs['encoding']: [B, N, D]
-    # 比如 N = 336（你注释里写的），D = hidden_dim
-    N = 336
     encoder_outputs = {
-        "encoding": torch.randn(B, N, config.hidden_dim, device=device)
+        "encoding": torch.randn(B, 336, config.hidden_dim, device=device),
+         "mask_emb": torch.randn(B, P, (config.future_len), 4, device=device),
     }
-
-    # 组装 inputs 字典，键名要和 Decoder.forward 里的一致
     inputs = {
-        "ego_current_state": ego_current_state,
-        "neighbor_agents_past": neighbor_agents_past,
+        "agents_history": agents_history,
+        "traffic_light_points": traffic_light_points,
+        "polylines": polylines,
+        "agents_type": agents_type,
         "route_lanes": route_lanes,
-        "sampled_trajectories": sampled_trajectories,
         "diffusion_time": diffusion_time,
+        "sampled_trajectories": sampled_trajectories,     
     }
 
     # ========= 4. 前向测试 =========
+    decoder = Decoder(config).to(device)
+    decoder.eval()
     with torch.no_grad():
         outputs = decoder(encoder_outputs, inputs)
 

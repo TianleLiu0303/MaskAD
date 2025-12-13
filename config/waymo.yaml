@@ -1,0 +1,60 @@
+#### train config ####
+batch_size: 1
+devices: [7]
+
+ego_neighbor_weight: 2.0
+
+lr: 0.0001
+weight_decay: 0.01
+lr_warmup_step: 1000
+lr_step_freq: 1000
+lr_step_gamma: 0.5
+
+epochs: 16
+
+save_dir: "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/train_logs/"
+exp_name: "waymo_experiment"
+
+#### model size ####
+hidden_dim: 256
+
+agent_num: 64                # ego + 63 neighbors
+predicted_neighbor_num: 63
+
+static_objects_num: 16        # traffic_light_points
+static_objects_dim: 3
+
+lane_num: 256
+lane_len: 30
+
+past_len: 11
+future_len: 80
+
+route_num: 6                 # Waymo route_lanes 实际数量
+
+#### encoder config ####
+encoder_drop_path_rate: 0.1
+encoder_depth: 2
+encoder_tokens_mlp_dim: 64
+encoder_channels_mlp_dim: 128
+encoder_dim_head: 64
+encoder_num_heads: 4
+enable_encoder_attn_dist: true
+encoder_attn_dropout: 0.1
+
+#### decoder config ####
+decoder_drop_path_rate: 0.1
+decoder_depth: 1
+num_heads: 4
+
+#### diffusion params ####
+diffusion_steps: 50
+schedule_type: cosine
+schedule_s: 0
+schedule_e: 1
+schedule_tau: 1
+schedule_scale: 1.0
+guidance_fn: None
+
+#### normalization ####
+normalization_file_path: "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/normalization.json"

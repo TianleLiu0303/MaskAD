@@ -473,23 +473,17 @@ def test():
         # ---------- Agents ----------
         # (x, y, yaw, vx, vy, length, width, height)
         "agents_history": torch.randn(B, 64, 11, 8, device=device),
-
         # (x, y, yaw, vx, vy)
         "agents_future": torch.randn(B, 64, 81, 5, device=device),
-
         "agents_type": torch.randint(0, 6, (B, 64), device=device),
-
         # ---------- Static ----------
         # traffic light points (x, y, state)
         "traffic_light_points": torch.randn(B, 16, 3, device=device),
-
         # ---------- Map ----------
         # polylines: (x, y, heading, traffic_light_state, lane_type)
         "polylines": torch.randn(B, 256, 30, 5, device=device),
-
         # route lanes: same format as polylines
         "route_lanes": torch.randn(B, 6, 30, 5, device=device),
-
         # ---------- Meta (可选，但推荐有) ----------
         "scenario_id": ["debug_scenario_0", "debug_scenario_1"],
         "sdc_id": torch.zeros(B, dtype=torch.long, device=device),

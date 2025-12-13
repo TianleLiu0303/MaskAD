@@ -242,7 +242,6 @@ def data_process_agent(
             - agents_interested (ndarray): The interest level of agents. Shape: (max_object,)
             - agents_type (ndarray): The type of agents. Shape: (max_object,)
     """
-    pri
     if use_log:
         log_trajectory = scenario.log_trajectory
     else:
@@ -309,7 +308,7 @@ def data_process_agent(
         agents_history[:, :-1] = 0
     
     
-    return (agents_history, agents_future, agents_interested, agents_type, agent_ids)
+    return (agents_history, agents_future, agents_interested, agents_type, agent_ids, sdc_id)
 
 def data_process_traffic_light(
     scenario,
@@ -325,7 +324,7 @@ def data_process_traffic_light(
         tuple: A tuple containing the processed traffic light points, lane IDs, and states.
     """
     traffic_lights = scenario.log_traffic_light
-        
+
     ############# Get Traffic Lights #############
     traffic_lane_ids = np.asarray(traffic_lights.lane_ids)[:, current_index]
     traffic_light_states = np.asarray(traffic_lights.state)[:, current_index]
@@ -339,8 +338,9 @@ def data_process_traffic_light(
         traffic_light_points,
         0.0
     )
-
+        
     return traffic_light_points, traffic_lane_ids, traffic_light_states
+
 def data_process_scenario(
     scenario,
     max_num_objects = 64,
@@ -360,7 +360,7 @@ def data_process_scenario(
     Returns:
         dict: A dictionary containing the processed data.
     """
-    (agents_history, agents_future, agents_interested, agents_type, agents_id) = data_process_agent(
+    (agents_history, agents_future, agents_interested, agents_type, agents_id, sdc_id) = data_process_agent(
         scenario,
         max_num_objects = max_num_objects,
         current_index = current_index,
@@ -375,9 +375,8 @@ def data_process_scenario(
     )
     
     roadgraph_points = scenario.roadgraph_points
-    
+
     ############### get roadgraph points near agents ###############
-    ############## (x, y, heading, traffic_light_state, lane_type) ###
     map_ids = []
     current_valid = agents_interested > 0
     
@@ -439,6 +438,22 @@ def data_process_scenario(
         polylines = np.pad(polylines, ((0, max_polylines-polylines.shape[0]), (0, 0), (0, 0)))
         polylines_valid = np.pad(polylines_valid, (0, max_polylines-polylines_valid.shape[0]))
 
+    # ======= build route_lanes (scheme 2) =======
+    ego_xy = agents_history[0, -1, 0:2]
+    ego_heading = float(agents_history[0, -1, 2])
+
+    route_lanes, route_lanes_valid, route_lane_indices = build_route_lanes_waymo_scheme2(
+        polylines=polylines,
+        polylines_valid=polylines_valid,
+        ego_xy=ego_xy,
+        ego_heading=ego_heading,
+        K=6,              # 对齐你 nuPlan 的 route_lanes 数量习惯
+        dist_th=40.0,
+        heading_th=0.7,
+    )
+    ##################################################
+
+
     relations = calculate_relations(agents_history, polylines, traffic_light_points)
     relations = np.asarray(relations)
     
@@ -450,8 +465,12 @@ def data_process_scenario(
         'traffic_light_points': np.float32(traffic_light_points),
         'polylines': np.float32(polylines),
         'polylines_valid': np.int32(polylines_valid),
+         # 新增：Waymo 的 route_lanes（方案2）
+        'route_lanes': np.float32(route_lanes),                 # [K,P,5]
+        'route_lanes_valid': np.int32(route_lanes_valid),       # [K]
         'relations': np.float32(relations),
         'agents_id': np.int32(agents_id),
+        'sdc_id': np.int32(sdc_id),
     }
     return data_dict
 
@@ -478,3 +497,81 @@ def data_collate_fn(batch_list):
             input_batch[key] = value
             
     return input_batch
+
+
+
+###   新加代码  ##
+def _nearest_point_info(polyline_xyh: np.ndarray, ego_xy: np.ndarray):
+    """
+    polyline_xyh: [P, 3] (x,y,heading)
+    ego_xy: [2]
+    return: (min_dist, nearest_idx)
+    """
+    d = np.linalg.norm(polyline_xyh[:, :2] - ego_xy[None, :], axis=-1)
+    idx = int(d.argmin())
+    return float(d[idx]), idx
+
+
+def build_route_lanes_waymo_scheme2(
+    polylines: np.ndarray,         # [N, P, 5] (x,y,heading,tl,type)
+    polylines_valid: np.ndarray,   # [N]
+    ego_xy: np.ndarray,            # [2]
+    ego_heading: float,            # scalar
+    K: int = 6,
+    dist_th: float = 40.0,
+    heading_th: float = 0.7,
+):
+    """
+    Return:
+      route_lanes: [K, P, 5]
+      route_lanes_valid: [K]
+      route_lane_indices: [K]  (invalid filled with -1)
+    """
+    P = polylines.shape[1]
+    route_lanes = np.zeros((K, P, polylines.shape[2]), dtype=np.float32)
+    route_valid = np.zeros((K,), dtype=np.int32)
+    route_idx = -np.ones((K,), dtype=np.int32)
+
+    ego_dir = np.array([np.cos(ego_heading), np.sin(ego_heading)], dtype=np.float32)
+
+    candidates = []
+    for i in range(polylines.shape[0]):
+        if polylines_valid[i] == 0:
+            continue
+
+        pl = polylines[i]  # [P,5]
+        # 你这里的 padding 点可能是 0，需要去掉纯 0 点
+        mask_pts = (pl[:, 0] != 0) | (pl[:, 1] != 0)
+        if not mask_pts.any():
+            continue
+        pl_use = pl[mask_pts]
+
+        # 最近点
+        min_dist, near_idx = _nearest_point_info(pl_use[:, :3], ego_xy)
+        if min_dist > dist_th:
+            continue
+
+        p_near = pl_use[near_idx, :2]
+        hdg_near = float(pl_use[near_idx, 2])
+
+        # 前向性
+        forward = float(np.dot((p_near - ego_xy), ego_dir))
+        if forward <= 0.0:
+            continue
+
+        # heading 对齐
+        align = float(np.cos(hdg_near - ego_heading))
+        if align < heading_th:
+            continue
+
+        candidates.append((min_dist, i))
+
+    candidates.sort(key=lambda x: x[0])
+    chosen = [idx for _, idx in candidates[:K]]
+
+    for j, i in enumerate(chosen):
+        route_lanes[j] = polylines[i]
+        route_valid[j] = 1
+        route_idx[j] = i
+
+    return route_lanes, route_valid, route_idx

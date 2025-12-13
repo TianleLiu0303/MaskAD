@@ -74,6 +74,7 @@ class JointAttention(Module):
         Global attention of inputs features.
         Reference implementation: https://github.com/lucidrains/mmdit
         """
+        print(dim_inputs[0])
 
         dim_inner = dim_head * heads
 

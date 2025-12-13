@@ -41,7 +41,7 @@ class Encoder(nn.Module):
         )
 
         self.static_encoder = StaticFusionEncoder(
-            dim=10,
+            dim=config.static_objects_dim,
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
         )
@@ -66,29 +66,31 @@ class Encoder(nn.Module):
         )
 
         # position embedding encode x, y, cos, sin, type
-        self.pos_emb = nn.Linear(7, config.hidden_dim)
+        self.pos_emb = nn.Linear(5, config.hidden_dim)
 
 
     def forward(self, inputs):
 
         encoder_outputs = {}
 
-        agents = inputs['agents_past']
+        agents = inputs['agents_history']
 
         # static objects
-        static = inputs['static_objects']
+        static = inputs['traffic_light_points']
 
         # vector maps
-        lanes = inputs['lanes']
-        lanes_speed_limit = inputs['lanes_speed_limit']
-        lanes_has_speed_limit = inputs['lanes_has_speed_limit']
+        lanes = inputs['polylines']
+
+        agents_type = inputs['agents_type']
+        # lanes_speed_limit = inputs['lanes_speed_limit']
+        # lanes_has_speed_limit = inputs['lanes_has_speed_limit']
 
 
         B = agents.shape[0]
 
-        encoding_agents, agents_mask, agent_pos = self.agent_encoder(agents)
+        encoding_agents, agents_mask, agent_pos = self.agent_encoder(agents,agents_type)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
-        encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(lanes, lanes_speed_limit, lanes_has_speed_limit)
+        encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(lanes)
 
         attn_dist = build_attn_bias_from_scene(
             agents,
@@ -108,13 +110,11 @@ class Encoder(nn.Module):
         encoding_pos = self.pos_emb(encoding_pos[~encoding_mask])
         encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim), device=encoding_pos.device)
         encoding_pos_result[~encoding_mask] = encoding_pos  # Fill in valid parts
-
+        
         encoding_output = encoding_output + encoding_pos_result.view(B, self.token_num, -1)
 
 
            # 加上位置 embedding
-        encoding_output = encoding_output + encoding_pos_result.view(B, self.token_num, -1)
-
 
         encoder_outputs['encoding'] = encoding_output
         encoder_outputs['encoding_agents'] = encoding_agents
@@ -128,65 +128,124 @@ class Encoder(nn.Module):
 
 ###### Scene encoder ######
 class AgentFusionEncoder(nn.Module):
-    def __init__(self, time_len=20, drop_path_rate=0.3, hidden_dim=192, depth=3, tokens_mlp_dim=64, channels_mlp_dim=128):
+    def __init__(
+        self,
+        time_len=20,
+        drop_path_rate=0.3,
+        hidden_dim=192,
+        depth=3,
+        tokens_mlp_dim=64,
+        channels_mlp_dim=128,
+        num_agent_types=6,  # 0~5
+    ):
         super().__init__()
 
         self._hidden_dim = hidden_dim
         self._channel = channels_mlp_dim
 
-        self.type_emb = nn.Linear(3, channels_mlp_dim)
+        self.STATE_DIM = 8  # x,y,yaw,vx,vy,length,width,height
 
-        self.channel_pre_project = Mlp(in_features=8+1, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.)
-        self.token_pre_project = Mlp(in_features=time_len, hidden_features=tokens_mlp_dim, out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.)
+        # 现在 agent_type 是 int(0~5)，用 Embedding
+        self.type_emb = nn.Embedding(num_agent_types, channels_mlp_dim)
 
-        self.blocks = nn.ModuleList([MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate) for i in range(depth)])
+        # +1 是 valid flag（逻辑不变）
+        self.channel_pre_project = Mlp(
+            in_features=self.STATE_DIM + 1,  # 8 + 1
+            hidden_features=channels_mlp_dim,
+            out_features=channels_mlp_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+        self.token_pre_project = Mlp(
+            in_features=time_len,
+            hidden_features=tokens_mlp_dim,
+            out_features=tokens_mlp_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+
+        self.blocks = nn.ModuleList(
+            [MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate) for _ in range(depth)]
+        )
 
         self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
+        self.emb_project = Mlp(
+            in_features=channels_mlp_dim,
+            hidden_features=hidden_dim,
+            out_features=hidden_dim,
+            act_layer=nn.GELU,
+            drop=drop_path_rate,
+        )
 
+    def forward(self, x, agent_type):
+        """
+        x:         [B, P, V, 8]  (x, y, yaw, vx, vy, length, width, height)
+        agent_type:[B, P]        int in {0,1,2,3,4,5}
+        return:
+          fused:  [B, P, hidden_dim]
+          mask_p: [B, P]  True=padding agent
+          pos:    [B, P, 7]  (保持原逻辑：先取最后帧的某些状态，再把最后3维改成“ego-like”标记)
+        """
 
-    def forward(self, x):
-        '''
-        x: B, P, V, D (x, y, cos, sin, vx, vy, w, l, type(3))
-        '''
-        neighbor_type = x[:, :, -1, 8:]
-        x = x[..., :8]
+        B, P, V, D = x.shape
+        assert D == self.STATE_DIM, f"expect x last dim={self.STATE_DIM}, got {D}"
 
-        pos = x[:, :, -1, :7].clone() # x, y, cos, sin
-        # neighbor: [1,0,0]
+        # ====== 1) 构造 pos（保持“步骤不变”）======
+        # 原来 pos = x[:, :, -1, :7]，其中包含 cos/sin。
+        # 现在输入是 yaw，所以这里用 cos(yaw), sin(yaw) 来对齐原语义。
+        # pos 仍然是 7 维：x,y,cos,sin,vx,vy,width  （你也可以把 width 换成 length，取决于你后面怎么用）
+        yaw = x[:, :, -1, 2]
+        pos = torch.stack(
+            [
+                x[:, :, -1, 0],                 # x
+                x[:, :, -1, 1],                 # y
+                torch.cos(yaw),                 # cos(yaw)
+                torch.sin(yaw),                 # sin(yaw)
+                x[:, :, -1, 3],                 # vx              # width
+            ],
+            dim=-1,
+        ).clone()  # [B,P,5]
+
+        # 完全保留原来的“ego-like”写法（步骤不变）
         pos[..., -3:] = 0.0
-        pos[..., -3] = 1.0 # B, P, 7
-        
-        B, P, V, _ = x.shape
-        mask_v = torch.sum(torch.ne(x[..., :8], 0), dim=-1).to(x.device) == 0
-        mask_p = torch.sum(~mask_v, dim=-1) == 0
-        x = torch.cat([x, (~mask_v).float().unsqueeze(-1)], dim=-1)
-        x = x.view(B * P, V, -1) # [B, P, V, 9]
+        pos[..., -3] = 1.0
 
-        valid_indices = ~mask_p.view(-1)  # [B*P]
-        x = x[valid_indices]  # x: [N_valid, V, 9]
+        # ====== 2) mask（逻辑不变）======
+        mask_v = torch.sum(torch.ne(x, 0), dim=-1).to(x.device) == 0  # [B,P,V]
+        mask_p = torch.sum(~mask_v, dim=-1) == 0                      # [B,P]
 
-        x = self.channel_pre_project(x)
+        # ====== 3) append valid flag（逻辑不变）======
+        x = torch.cat([x, (~mask_v).float().unsqueeze(-1)], dim=-1)   # [B,P,V,9]
+        x = x.view(B * P, V, -1)                                      # [B*P,V,9]
+
+        valid_indices = ~mask_p.view(-1)                              # [B*P]
+        x = x[valid_indices]                                          # [N_valid,V,9]
+
+        # ====== 4) Mixer（逻辑不变）======
+        x = self.channel_pre_project(x)          # [N_valid,V,C]
+        x = x.permute(0, 2, 1)                   # [N_valid,C,V]
+        x = self.token_pre_project(x)            # [N_valid, tokens_mlp_dim, channels_mlp_dim] (取决于你 Mlp 实现)
         x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)  # # x: [N_valid, tokens_mlp_dim, channels_mlp_dim]
+
         for block in self.blocks:
-            x = block(x)  
+            x = block(x)
 
-        # pooling
-        x = torch.mean(x, dim=1) # x: [N_valid, channels_mlp_dim]
+        # pooling（逻辑不变）
+        x = torch.mean(x, dim=1)                 # [N_valid, C]
 
-        neighbor_type = neighbor_type.view(B * P, -1)
-        neighbor_type = neighbor_type[valid_indices]
-        type_embedding = self.type_emb(neighbor_type)  # Type embedding for valid data
+        # ====== 5) type embedding（位置/步骤不变：pooling 后再加）======
+        agent_type_flat = agent_type.view(B * P).to(x.device).long()
+        agent_type_flat = agent_type_flat[valid_indices]              # [N_valid]
+        type_embedding = self.type_emb(agent_type_flat)               # [N_valid, C]
         x = x + type_embedding
 
-        x = self.emb_project(self.norm(x))
+        # ====== 6) 输出回填（逻辑不变）======
+        x = self.emb_project(self.norm(x))       # [N_valid, hidden_dim]
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
-        x_result[valid_indices] = x  # Fill in valid parts
-        
-        return x_result.view(B, P, -1) , mask_p.reshape(B, -1), pos.view(B, P, -1)
+        x_result[valid_indices] = x
+
+        return x_result.view(B, P, -1), mask_p.view(B, P), pos.view(B, P, -1)
 
 class StaticFusionEncoder(nn.Module):
     def __init__(self, dim, drop_path_rate=0.3, hidden_dim=192, device='cuda'):
@@ -198,18 +257,18 @@ class StaticFusionEncoder(nn.Module):
 
     def forward(self, x):
         '''
-        x: B, P, D (x, y, cos, sin, w, l, type(4))
+        x: B, P, D (x, y, traffic_light_state)
         ''' 
-        B, P, _ = x.shape
+        B, P, D = x.shape
 
-        pos = x[:, :, :7].clone() # x, y, cos, sin
+        pos = torch.zeros((B, P, 5), device=x.device, dtype=x.dtype)
         # static: [0,1,0]
         pos[..., -3:] = 0.0
         pos[..., -2] = 1.0
 
         x_result = torch.zeros((B * P, self._hidden_dim), device=x.device)
 
-        mask_p = torch.sum(torch.ne(x[..., :10], 0), dim=-1).to(x.device) == 0
+        mask_p = torch.sum(torch.ne(x[..., :3], 0), dim=-1).to(x.device) == 0
 
         valid_indices = ~mask_p.view(-1) 
 
@@ -222,120 +281,133 @@ class StaticFusionEncoder(nn.Module):
         return x_result.view(B, P, -1), mask_p.view(B, P), pos.view(B, P, -1)
 
 class LaneFusionEncoder(nn.Module):
-    def __init__(self, lane_len, drop_path_rate=0.3, hidden_dim=192, depth=3, tokens_mlp_dim=64, channels_mlp_dim=128):
+    def __init__(
+        self,
+        lane_len,
+        drop_path_rate=0.3,
+        hidden_dim=192,
+        depth=3,
+        tokens_mlp_dim=64,
+        channels_mlp_dim=128,
+        num_tl_states=9,      # traffic_light_state: 0..8
+        num_lane_types=20,    # lane_type: 0..19
+    ):
         super().__init__()
-
         self._lane_len = lane_len
-        
         self._channel = channels_mlp_dim
+        self.num_tl_states = num_tl_states
+        self.num_lane_types = num_lane_types
 
-        self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
-        self.unknown_speed_emb = nn.Embedding(1, channels_mlp_dim)
-        self.traffic_emb = nn.Linear(4, channels_mlp_dim)
+        geom_in_dim = 4  # (x, y, cos(h), sin(h))
 
-        self.channel_pre_project = Mlp(in_features=8, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.)
-        self.token_pre_project = Mlp(in_features=lane_len, hidden_features=tokens_mlp_dim, out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.)
+        self.traffic_emb = nn.Embedding(num_tl_states, channels_mlp_dim)
+        self.lane_type_emb = nn.Embedding(num_lane_types, channels_mlp_dim)
 
-        self.blocks = nn.ModuleList([MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate) for i in range(depth)])
-
-        self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
-
-    def forward(self, x, speed_limit, has_speed_limit):
-        '''
-        x: B, P, V, D (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4))
-        speed_limit: B, P, 1
-        has_speed_limit: B, P, 1
-        '''
-        traffic = x[:, :, 0, 8:]
-        x = x[..., :8]
-
-        pos = x[:, :, int(self._lane_len / 2), :7].clone() # x, y, x'-x, y'-y
-        heading = torch.atan2(pos[..., 3], pos[..., 2])
-        pos[..., 2] = torch.cos(heading)
-        pos[..., 3] = torch.sin(heading)
-        # lane: [0,0,1]
-        pos[..., -3:] = 0.0
-        pos[..., -1] = 1.0
-
-        B, P, V, _ = x.shape
-        mask_v = torch.sum(torch.ne(x[..., :8], 0), dim=-1).to(x.device) == 0
-        mask_p = torch.sum(~mask_v, dim=-1) == 0
-        x = x.view(B * P, V, -1)
-
-        valid_indices = ~mask_p.view(-1)  # [B*P] 的维度
-        x = x[valid_indices]  
-
-        x = self.channel_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
-        for block in self.blocks:
-            x = block(x)  
-
-        x = torch.mean(x, dim=1)
-
-        # Reshape speed_limit and traffic to match flattened dimensions
-        speed_limit = speed_limit.view(B * P, 1)
-        has_speed_limit = has_speed_limit.view(B * P, 1)
-        traffic = traffic.view(B * P, -1)
-
-        # Apply embedding directly to valid speed limit data
-        has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
-        speed_limit = speed_limit[valid_indices].squeeze(-1)
-        speed_limit_embedding = torch.zeros((speed_limit.shape[0], self._channel), device=x.device)
-
-        if has_speed_limit.sum() > 0:
-            speed_limit_with_limit = self.speed_limit_emb(speed_limit[has_speed_limit].unsqueeze(-1))
-            speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
-
-        if (~has_speed_limit).sum() > 0:
-            speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
-                (~has_speed_limit).sum().item(), -1
-            )
-            speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
-
-        # Process traffic lights directly for valid positions
-        traffic = traffic[valid_indices]
-        traffic_light_embedding = self.traffic_emb(traffic)  # Traffic light embedding for valid data
-
-
-        x = x + speed_limit_embedding + traffic_light_embedding
-        x = self.emb_project(self.norm(x))
-
-        x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
-        x_result[valid_indices] = x  # Fill in valid parts
-        
-        return x_result.view(B, P, -1) , mask_p.reshape(B, -1), pos.view(B, P, -1)
-
-####### KV encoder #################
-class FusionEncoder(nn.Module):
-    def __init__(self, hidden_dim=192, num_heads=6, drop_path_rate=0.3, depth=3, device='cuda'):
-        super().__init__()
-
-        dpr = drop_path_rate
-
+        self.channel_pre_project = Mlp(
+            in_features=geom_in_dim,
+            hidden_features=channels_mlp_dim,
+            out_features=channels_mlp_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+        self.token_pre_project = Mlp(
+            in_features=lane_len,
+            hidden_features=tokens_mlp_dim,
+            out_features=tokens_mlp_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
         self.blocks = nn.ModuleList(
-            [globalselfattention(hidden_dim, num_heads, dropout=dpr) for i in range(depth)]
+            [MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm(channels_mlp_dim)
+        self.emb_project = Mlp(
+            in_features=channels_mlp_dim,
+            hidden_features=hidden_dim,
+            out_features=hidden_dim,
+            act_layer=nn.GELU,
+            drop=drop_path_rate,
         )
 
-        self.norm = nn.LayerNorm(hidden_dim)
+    def forward(self, x):
+        """
+        x: [B, P, V, 5]
+           (...,0:5) = (x, y, heading, traffic_light_state, lane_type)
 
-    def forward(self, x, mask):
+        返回:
+            lane_feat: [B, P, hidden_dim]
+            mask_p:    [B, P]   (True: 整条 polyline 都是 padding)
+            pos:       [B, P, 5]  (中点的 [x, y, heading, tl_norm, lane_type_norm])
+        """
+        B, P, V, D = x.shape
+        assert D >= 5
 
-        mask[:, 0] = False
+        # -------- 1. 代表点 pos: 5 维 --------
+        mid_idx = self._lane_len // 2
+        mid_point = x[:, :, mid_idx, :]         # [B,P,5]
+        mid_x = mid_point[..., 0]
+        mid_y = mid_point[..., 1]
+        mid_heading = mid_point[..., 2]
+        mid_tl = mid_point[..., 3]
+        mid_lane_type = mid_point[..., 4]
 
-        for b in self.blocks:
-            x = b(x, mask)
+        pos = x.new_empty(B, P, 5)
+        pos[..., 0] = mid_x
+        pos[..., 1] = mid_y
+        pos[..., 2] = mid_heading
+        # 简单归一化到 [0,1] 区间（可选，不想归一化你可以直接用 mid_tl / mid_lane_type）
+        pos[..., 3] = mid_tl / float(self.num_tl_states - 1)      # traffic_light_state_norm
+        pos[..., 4] = mid_lane_type / float(self.num_lane_types - 1)  # lane_type_norm
 
-        return self.norm(x)
+        # -------- 2. 点级几何特征 --------
+        coords = x[..., 0:2]          # [B,P,V,2]
+        heading = x[..., 2]           # [B,P,V]
+        cos_h = torch.cos(heading)
+        sin_h = torch.sin(heading)
+        geom = torch.cat([coords, cos_h.unsqueeze(-1), sin_h.unsqueeze(-1)], dim=-1)  # [B,P,V,4]
+
+        # 与前面版本相同的 mask / embedding / Mixer 流程
+        mask_v = torch.sum(torch.ne(geom, 0), dim=-1) == 0
+        mask_p = torch.sum(~mask_v, dim=-1) == 0
+
+        geom = geom.view(B * P, V, -1)
+        tl_state = x[..., 3].view(B * P, V).long()
+        lane_type = x[..., 4].view(B * P, V).long()
+
+        valid_indices = ~mask_p.view(-1)
+        geom = geom[valid_indices]
+        tl_state = tl_state[valid_indices]
+        lane_type = lane_type[valid_indices]
+
+        x_feat = self.channel_pre_project(geom)
+
+        tl_state = torch.clamp(tl_state, 0, self.num_tl_states - 1)
+        tl_emb = self.traffic_emb(tl_state)
+
+        lane_type = torch.clamp(lane_type, 0, self.num_lane_types - 1)
+        lane_emb = self.lane_type_emb(lane_type)
+
+        x_feat = x_feat + tl_emb + lane_emb
+
+        x_feat = x_feat.permute(0, 2, 1)
+        x_feat = self.token_pre_project(x_feat)
+        x_feat = x_feat.permute(0, 2, 1)
+        for block in self.blocks:
+            x_feat = block(x_feat)
+
+        x_feat = torch.mean(x_feat, dim=1)
+        x_feat = self.emb_project(self.norm(x_feat))      # [N_valid, hidden_dim]
+
+        x_result = x.new_zeros(B * P, x_feat.shape[-1])
+        x_result[valid_indices] = x_feat
+        x_result = x_result.view(B, P, -1)
+
+        return x_result, mask_p, pos
+
 
 
 
 ################### test ################
-
-
-
 
 if __name__ == "__main__":
     import torch
@@ -343,21 +415,23 @@ if __name__ == "__main__":
 
     # ===== 1. 配一个简单的 config =====
     config = SimpleNamespace()
-    config.hidden_dim = 192
+    config.hidden_dim = 256
 
-    config.agent_num = 33               # neighbor_agents_past 里 P 的大小
-    config.static_objects_num = 5
-    config.lane_num = 70
+    config.agent_num = 64               # neighbor_agents_past 里 P 的大小
+    config.static_objects_num = 16
+    config.lane_num = 256
 
-    config.past_len = 20               # AgentFusionEncoder: time_len
-    config.lane_len = 20               # LaneFusionEncoder: lane_len
+    config.static_objects_dim = 3
+
+    config.past_len = 11              # AgentFusionEncoder: time_len
+    config.lane_len = 30               # LaneFusionEncoder: lane_len
 
     config.encoder_drop_path_rate = 0.1
     config.encoder_depth = 2
     config.encoder_tokens_mlp_dim = 64
     config.encoder_channels_mlp_dim = 128
 
-    config.encoder_dim_head = 48
+    config.encoder_dim_head = 64
     config.encoder_num_heads = 4
     config.enable_encoder_attn_dist = True
     config.encoder_attn_dropout = 0.1
@@ -373,30 +447,24 @@ if __name__ == "__main__":
     lane_len = config.lane_len
 
     # neighbor_agents_past: (x, y, cos, sin, vx, vy, w, l, type(3)) → D = 11
-    neighbor_agents_past = torch.randn(B, N_agents, T_hist, 11, device=device)
+    agents_history = torch.randn(B, N_agents, T_hist,8, device=device)
 
     # static_objects: (x, y, cos, sin, w, l, type(4)) → D = 10
-    static_objects = torch.randn(B, N_static, 10, device=device)
+    traffic_light_points = torch.randn(B, N_static, 3, device=device)
 
     # lanes: (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4)) → D = 12
-    lanes = torch.randn(B, N_lanes, lane_len, 12, device=device)
+    polylines = torch.randn(B, N_lanes, lane_len, 5, device=device)
 
-    # 车道限速信息
-    lanes_speed_limit = torch.randn(B, N_lanes, 1, device=device)
-    lanes_has_speed_limit = torch.randint(0, 2, (B, N_lanes, 1), device=device).bool()
-
-    # routes 目前 Encoder.forward 没用到，造一个占位
-    routes = torch.randn(B, 4, 10, 4, device=device)  # 只是举例，shape 随便
+    agents_type = torch.randint(0, 4, (B, N_agents), device=device)
 
     inputs = {
-        "agents_past": neighbor_agents_past,
-        "static_objects": static_objects,
-        "lanes": lanes,
-        "lanes_speed_limit": lanes_speed_limit,
-        "lanes_has_speed_limit": lanes_has_speed_limit,
-        "routes": routes,
+        "agents_history": agents_history,
+        "traffic_light_points": traffic_light_points,
+        "polylines": polylines,
+        "agents_type": agents_type,
     }
-
+    for k, v in inputs.items():
+        print(k, v.shape)
     # ===== 3. 实例化 Encoder 并前向 =====
     encoder = Encoder(config).to(device)
 
@@ -406,9 +474,5 @@ if __name__ == "__main__":
     # ===== 4. 打印检查一下 =====
     encoding = outputs["encoding"]
     print("encoding shape:", encoding.shape)  # 期望: [B, token_num, hidden_dim]
-    print("encoding_agents shape:", outputs["encoding_agents"].shape)   
-    print("agents_mask shape:", outputs["agents_mask"].shape)
-    print("static_mask shape:", outputs["static_mask"].shape)
-    print("lanes_mask shape:", outputs["lanes_mask"].shape)
 
     print("Test passed.")

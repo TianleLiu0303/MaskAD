@@ -93,9 +93,9 @@ class MaskNet(nn.Module):
 if __name__ == "__main__":
     # 简单测试
     B = 2
-    N_ctx = 107    # 所有 token 数量
-    N_agent = 33   # 车辆数
-    D = 192
+    N_ctx = 336    # 所有 token 数量
+    N_agent = 64   # 车辆数
+    D = 256
     T_fut = 80
     d_model = 4
 
