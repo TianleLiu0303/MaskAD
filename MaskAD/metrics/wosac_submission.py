@@ -21,8 +21,8 @@ from torch import Tensor
 from torchmetrics.metric import Metric
 from waymo_open_dataset.protos import sim_agents_submission_pb2
 
-from src.utils import RankedLogger
-from src.utils.wosac_utils import get_scenario_id_int_tensor
+from MaskAD.utils import RankedLogger
+from MaskAD.utils.wosac_utils import get_scenario_id_int_tensor
 
 log = RankedLogger(__name__, rank_zero_only=False)
 

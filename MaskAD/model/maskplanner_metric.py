@@ -15,6 +15,11 @@ from MaskAD.model.diffusion_utils.sampling import dpm_sampler
 from torch.nn.functional import smooth_l1_loss, cross_entropy
 
 
+### 引入模块metric
+from MaskAD.metrics.wosac_submission import WOSACSubmission
+from MaskAD.metrics.wosac_metrics import WOSACMetrics
+from MaskAD.utils.wosac_utils import get_scenario_rollouts, get_scenario_id_int_tensor
+
 class Diffusion_Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -90,15 +95,22 @@ class Diffusion_Decoder(nn.Module):
         
         return decoder_outputs
 
-class MaskPlanner(pl.LightningModule):
+class MaskPlannerMetric(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
 
         self.cfg = config
+
         # self.save_hyperparameters(self.cfg)
         self.encoder = Diffusion_Encoder(config)
         self.decoder = Diffusion_Decoder(config)
         # self.sampler = DDPM_Sampler(config)
+        self.val_closed_loop = getattr(config, "val_closed_loop", True)
+        self.n_rollout_closed_val = getattr(config, "n_rollout_closed_val", 6)
+        self.n_batch_wosac_metric = getattr(config, "n_batch_wosac_metric", 999999)
+
+        self.wosac_metrics = WOSACMetrics(prefix="val_closed")   # 只算指标，不存 submission
+
 
         self.mask_net = MaskNet(
             hidden_dim=config.hidden_dim,   # scene_feat 的 D 维
@@ -414,6 +426,31 @@ class MaskPlanner(pl.LightningModule):
         }
         return total_loss, log_dict
  
+    @torch.no_grad()
+    def forward_inference_rollouts(self, batch, n_rollout: int=32):
+        """
+        返回：
+        pred_traj: [B, P, R, T, 2]
+        pred_head: [B, P, R, T]
+        pred_z:    [B, P, R, T]  (WOSAC 需要 center_z，每步一个；没有就先用 0)
+        """
+        trajs, heads = [], []
+        for _ in range(n_rollout):
+            out = self.forward_inference(batch)               # [B,P,T,4]
+            xycs = out["prediction"]
+            trajs.append(xycs[..., :2])                       # [B,P,T,2]
+            heads.append(torch.atan2(xycs[..., 3], xycs[..., 2]))  # [B,P,T]
+
+        pred_traj = torch.stack(trajs, dim=2)   # [B,P,R,T,2]
+        pred_head = torch.stack(heads, dim=2)   # [B,P,R,T]
+
+        z0 = batch["agents_z_future"][:, :, 0, 0]          # [B, A]
+        pred_z = z0.unsqueeze(-1).expand(-1, -1, 80)       # [B, A, 80]
+        pred_z = pred_z.unsqueeze(2).expand(-1, -1, n_rollout, -1)  # [B, A, n_rollout, 80]
+    # [B,P,R,T]
+        return pred_traj, pred_z, pred_head
+
+
     def training_step(self, batch, batch_idx):
         """
         模型的训练步骤。
@@ -424,13 +461,53 @@ class MaskPlanner(pl.LightningModule):
         return loss
     
     def validation_step(self, batch, batch_idx):
-        """
-        Validation step of the model.
-        """
-        loss, log_dict = self.forward_train(batch)
-        val_log = {f"val_{k}": v for k, v in log_dict.items()}
-        self.log_dict(val_log, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
-        return loss
+        if not self.val_closed_loop:
+            return
+
+        # 1) rollouts
+        pred_traj, pred_z, pred_head = self.forward_inference_rollouts(batch)  # [B,P,R,T,2], [B,P,R,T], [B,P,R,T]
+
+        B = pred_traj.shape[0]
+        P = pred_traj.shape[1]
+        R = pred_traj.shape[2]
+        T = pred_traj.shape[3]
+        device = pred_traj.device
+
+        # 2) flatten 到 n_agent 形式（WOSAC utils 需要）
+        pred_traj = pred_traj.reshape(B * P, R, T, 2)
+        pred_z    = pred_z.reshape(B * P, R, T)
+        pred_head = pred_head.reshape(B * P, R, T)
+
+        # 3) agent_id / agent_batch / scenario_id
+        # 你必须确保 dataloader 提供：
+        #   - batch["agents_id"] 或 batch["agent_id"] 类似字段（每个 scenario 的每个 agent 的 object_id）
+        #   - batch["tfrecord_path"]：每个 scenario 的 tfrecord 文件路径
+        #   - batch["scenario_id"]：每个 scenario 的字符串 id
+        agent_id = batch["agents_object_id"][:, :P].reshape(B * P)  # [B*P]
+        agent_batch = torch.arange(B, device=device).unsqueeze(1).repeat(1, P).reshape(B * P)  # [B*P]
+
+        scenario_id = get_scenario_id_int_tensor(batch["scenario_id"], device=device)  # [B,16]
+
+        scenario_rollouts = get_scenario_rollouts(
+            scenario_id=scenario_id,
+            agent_id=agent_id,
+            agent_batch=agent_batch,
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head,
+        )
+
+        print("have been here")
+        # 4) update metric（注意：需要 tfrecord_path 是 List[str]，长度 B）
+        if batch_idx < self.n_batch_wosac_metric:
+            self.wosac_metrics.update(batch["tfrecord_path"], scenario_rollouts)
+    def on_validation_epoch_end(self):
+        metrics = self.wosac_metrics.compute()
+        if self.global_rank == 0:
+            for k, v in metrics.items():
+                self.log(k, v, sync_dist=True, prog_bar=True)  # 或者 self.logger.log_metrics(metrics)
+        self.wosac_metrics.reset()
+
 
 
 ######################test##############################
@@ -441,31 +518,14 @@ def load_config_from_yaml(cfg_path):
     cfg = OmegaConf.load(cfg_path)
     return cfg
 
-def inspect_gradients(model):
-    """
-    打印每个参数的:
-      - 完整名字
-      - 是否需要梯度 (requires_grad)
-      - 是否得到了梯度 (grad is None?)
-      - 梯度范数 (grad_norm)
-    """
-    print("\n========== 模型梯度检查 ==========\n")
-    for name, p in model.named_parameters():
-        req = p.requires_grad
-        has_grad = p.grad is not None
-        grad_norm = p.grad.norm().item() if has_grad else None
-        print(f"{name:60s} | req_grad={req} | has_grad={has_grad} | grad_norm={grad_norm}")
-    print("\n========== 结束 ==========\n")
-
-
 def test():
     cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/waymo.yaml"
     config = load_config_from_yaml(cfg_path)
 
     # ====== 1. 实例化模型 ======
-    model = MaskPlanner(config).cuda()
+    model = MaskPlannerMetric(config).cuda()
 
-    B = 2  # batch size
+    B = 1  # batch size
     device = "cuda"
 
     # ====== 2. 构造 Waymo 风格 batch ======
@@ -473,109 +533,54 @@ def test():
         # ---------- Agents ----------
         # (x, y, yaw, vx, vy, length, width, height)
         "agents_history": torch.randn(B, 64, 11, 8, device=device),
+
+        "agents_z_history": torch.randn(B, 64, 11, 1, device=device),
+        
+        "agents_z_future": torch.randn(B, 64, 81, 1, device=device),
+
         # (x, y, yaw, vx, vy)
         "agents_future": torch.randn(B, 64, 81, 5, device=device),
+
         "agents_type": torch.randint(0, 6, (B, 64), device=device),
+
+        "agents_slot": torch.tensor([
+            [  3,   0,   1,   2,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,  15,
+            16,  17,  18,  19,  20,  21,  22,  23,
+            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1]
+        ], dtype=torch.int64),
+
+        "agents_object_id": torch.tensor([
+            [248, 233, 238, 239, 215, 216, 213, 214, 212, 220, 219, 217, 218, 228, 227, 222,
+            211, 224, 225, 223, 232, 221, 226, 230, 231,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            -1, -1, -1, -1]
+        ], dtype=torch.int64),
+
         # ---------- Static ----------
         # traffic light points (x, y, state)
         "traffic_light_points": torch.randn(B, 16, 3, device=device),
+
         # ---------- Map ----------
         # polylines: (x, y, heading, traffic_light_state, lane_type)
         "polylines": torch.randn(B, 256, 30, 5, device=device),
+
         # route lanes: same format as polylines
         "route_lanes": torch.randn(B, 6, 30, 5, device=device),
+
         # ---------- Meta (可选，但推荐有) ----------
-        "scenario_id": ["debug_scenario_0", "debug_scenario_1"],
-        "sdc_id": torch.zeros(B, dtype=torch.long, device=device),
+        "scenario_id": ["befb50d537f4b734"]*B,
+        "tfrecord_path": ["/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module/validation_tfexample.tfrecord-00000-of-00150"]*B,
     }
 
     # ====== 3. eval：前向 + loss（不反传） ======
     model.eval()
     with torch.no_grad():
-        loss, log_dict = model.forward_train(batch)
-
-    print("=== 前向检查 (eval) ===")
-    print("total loss:", loss.item())
-    for k, v in log_dict.items():
-        print(f"{k}: {v.item()}")
-
-    # ====== 4. train：反向传播检查 ======
-    model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-    optimizer.zero_grad()
-    loss, log_dict = model.forward_train(batch)
-    loss.backward()
-
-    # ---- 4.1 整体梯度范数 ----
-    total_grad_sq = 0.0
-    for _, p in model.named_parameters():
-        if p.grad is not None:
-            total_grad_sq += p.grad.norm().item() ** 2
-    total_grad_norm = total_grad_sq ** 0.5
-
-    print("\n=== 反向传播检查 ===")
-    print("total grad norm:", total_grad_norm)
-
-    # ---- 4.2 MaskNet 梯度检查（重点）----
-    print("\n=== MaskNet 梯度检查 ===")
-    for name, p in model.named_parameters():
-        if "mask_net" in name:
-            has_grad = p.grad is not None
-            grad_norm = p.grad.norm().item() if has_grad else None
-            print(f"{name:60s} | has_grad={has_grad} | grad_norm={grad_norm}")
-
-    # ---- 4.3 打印所有参数梯度状态 ----
-    inspect_gradients(model)
-
-    # ---- 4.4 optimizer step（确保不报错）----
-    optimizer.step()
-
-    print("\n=== 测试完成：Waymo MaskPlanner 训练路径 OK ===")
-
-def inference_test():
-    cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/waymo.yaml"
-    config = load_config_from_yaml(cfg_path)
-
-    device = "cuda"
-    model = MaskPlanner(config).to(device)
-    model.eval()
-
-    B = 2
-    P = 1 + config.predicted_neighbor_num
-    T = config.future_len
-
-    # ---- Waymo batch（和你 forward_train 测试一致）----
-    batch = {
-        "agents_history": torch.randn(B, 64, 11, 8, device=device),
-        "agents_future": torch.randn(B, 64, 81, 5, device=device),   # inference 不一定用，但保留无妨
-        "agents_type": torch.randint(0, 6, (B, 64), device=device),
-
-        "traffic_light_points": torch.randn(B, 16, 3, device=device),
-
-        "polylines": torch.randn(B, 256, 30, 5, device=device),
-        "route_lanes": torch.randn(B, 6, 30, 5, device=device),
-
-        "scenario_id": ["debug_scenario_0", "debug_scenario_1"],
-        "sdc_id": torch.zeros(B, dtype=torch.long, device=device),
-    }
-
-    with torch.no_grad():
-        out = model.forward_inference(batch)
-
-    pred = out["prediction"]
-    print("\n=== Inference 输出检查 ===")
-    print("prediction shape:", pred.shape)
-
-    assert pred.shape == (B, P, T, 4), \
-        f"pred shape mismatch, expect {(B,P,T,4)}, got {tuple(pred.shape)}"
-
-    # 可选：检查 ego(0号) current 是否没被污染（推理里 constraint 固定 current，但输出已去掉 current 帧）
-    # 这里只是 sanity check：看 pred 是否有 NaN
-    assert torch.isfinite(pred).all(), "prediction has NaN/Inf!"
-
-    print("✅ inference_test passed.")
-
+        model.validation_step(batch, 0)
+    model.on_validation_epoch_end()
 
 if __name__ == "__main__":
-    inference_test()
+    test()  

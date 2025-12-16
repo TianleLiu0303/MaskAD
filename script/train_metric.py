@@ -13,7 +13,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from omegaconf import OmegaConf
 
 # ====== 模型 ======
-from MaskAD.model.maskplanner import MaskPlanner
+from MaskAD.model.maskplanner_metric import MaskPlannerMetric
 from MaskAD.GRPO.GRPO_waymo import MaskPlannerGRPO
 
 # ====== Waymo Dataset ======
@@ -167,7 +167,7 @@ def main():
 
     # ===== 2) model =====
     if train_mode == "il":
-        model = MaskPlanner(cfg)
+        model = MaskPlannerMetric(cfg)
         exp_suffix = "IL"
     else:
         model = MaskPlannerGRPO(cfg)

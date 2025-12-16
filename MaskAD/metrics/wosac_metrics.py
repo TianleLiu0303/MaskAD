@@ -176,9 +176,7 @@ class WOSACMetrics(Metric):
 
     @staticmethod
     def load_metrics_config() -> sim_agents_metrics_pb2.SimAgentMetricsConfig:
-        config_path = (
-            Path(wosac_metrics.__file__).parent / "challenge_2024_config.textproto"
-        )
+        config_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/challenge_2024_config.textproto"
         with open(config_path, "r") as f:
             config = sim_agents_metrics_pb2.SimAgentMetricsConfig()
             text_format.Parse(f.read(), config)

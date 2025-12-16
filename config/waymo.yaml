@@ -1,60 +1,135 @@
-#### train config ####
+# ============================================================
+#                     Training / Runtime
+# ============================================================
+train_mode: "il"          # "il" or "grpo"
 batch_size: 1
-devices: [7]
-
-ego_neighbor_weight: 2.0
+devices: [0]
+num_workers: 8
+pin_memory: true
+drop_last: true
 
 lr: 0.0001
 weight_decay: 0.01
 lr_warmup_step: 1000
 lr_step_freq: 1000
 lr_step_gamma: 0.5
+grad_clip: 1.0
 
 epochs: 16
+log_every_n_steps: 50
+check_val_every_n_epoch: 1
 
+# monitor for ModelCheckpoint
+monitor_key: "val_loss"
+monitor_mode: "min"
+save_top_k: 3
+
+# ============================================================
+#                     Paths / Logging
+# ============================================================
 save_dir: "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/train_logs/"
 exp_name: "waymo_experiment"
 
-#### model size ####
+# ---- Waymo processed pkl dirs ----
+train_data_dir: "/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed"
+val_data_dir: "/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed"
+
+# ---- anchors for your dataset ----
+anchor_path: "data/cluster_64_center_dict.pkl"
+
+# dataset behaviors (optional)
+strict_keys: false
+sort_files: true
+
+# optional: keep only needed keys (if your WaymoDataset supports keep_keys)
+# keep_keys:
+#   - agents_history
+#   - agents_interested
+#   - agents_type
+#   - agents_future
+#   - traffic_light_points
+#   - polylines
+#   - polylines_valid
+#   - route_lanes
+#   - route_lanes_valid
+#   - relations
+#   - agents_id
+#   - sdc_id
+#   - scenario_id
+#   - tfrecord_path
+
+# ============================================================
+#                     Loss weights
+# ============================================================
+ego_neighbor_weight: 2.0
+
+# ============================================================
+#                     Dimensions
+# ============================================================
 hidden_dim: 256
 
-agent_num: 64                # ego + 63 neighbors
-predicted_neighbor_num: 63
-
-static_objects_num: 16        # traffic_light_points
-static_objects_dim: 3
-
+agent_num: 64
+static_objects_num: 16
 lane_num: 256
-lane_len: 30
 
 past_len: 11
 future_len: 80
+lane_len: 30
 
-route_num: 6                 # Waymo route_lanes 实际数量
+predicted_neighbor_num: 63   # ego + 63 = 64 agents
+route_num: 6                 # route_lanes: [B,6,30,5]
 
-#### encoder config ####
+# ============================================================
+#                     Encoder
+# ============================================================
 encoder_drop_path_rate: 0.1
 encoder_depth: 2
 encoder_tokens_mlp_dim: 64
 encoder_channels_mlp_dim: 128
 encoder_dim_head: 64
 encoder_num_heads: 4
-enable_encoder_attn_dist: true
 encoder_attn_dropout: 0.1
+enable_encoder_attn_dist: true
 
-#### decoder config ####
+static_objects_dim: 3   # traffic_light_points (x,y,state)
+
+# ============================================================
+#                     Decoder / DiT
+# ============================================================
 decoder_drop_path_rate: 0.1
 decoder_depth: 1
 num_heads: 4
 
-#### diffusion params ####
+# ============================================================
+#                     Diffusion
+# ============================================================
 diffusion_steps: 50
 schedule_type: cosine
 schedule_s: 0
 schedule_e: 1
 schedule_tau: 1
 schedule_scale: 1.0
-guidance_fn: None
 
-#### normalization ####
+# ============================================================
+#                     Normalization
+# ============================================================
 normalization_file_path: "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/normalization.json"
+
+# ============================================================
+#                 Validation / WOSAC
+# ============================================================
+val_closed_loop: true
+n_rollout_closed_val: 6
+n_batch_wosac_metric: 2
+
+# ============================================================
+#              WOSAC Submission (Waymo official)
+# ============================================================
+wosac_submission:
+  is_active: false        # 训练阶段必须 false（不然要写 submission shard）
+  method_name: "MaskPlanner"
+  authors: ["Anonymous"]
+  affiliation: "Anonymous"
+  description: "Mask-guided diffusion planner for Waymo Sim Agents"
+  method_link: ""
+  account_name: "Anonymous"

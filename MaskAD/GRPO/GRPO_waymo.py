@@ -412,13 +412,13 @@ class MaskPlannerGRPO(MaskPlanner):
     # Lightning: train/val 直接走 GRPO
     def training_step(self, batch, batch_idx):
         loss, log_dict = self.forward_grpo_diffusion(batch, deterministic=False)
-        train_log = {f"train/{k}": v for k, v in log_dict.items()}
+        train_log = {f"train_{k}": v for k, v in log_dict.items()}
         self.log_dict(train_log, on_step=True, on_epoch=False, sync_dist=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, log_dict = self.forward_grpo_diffusion(batch, deterministic=True)
-        val_log = {f"val/{k}": v for k, v in log_dict.items()}
+        val_log = {f"val_{k}": v for k, v in log_dict.items()}
         self.log_dict(val_log, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
         return loss
 

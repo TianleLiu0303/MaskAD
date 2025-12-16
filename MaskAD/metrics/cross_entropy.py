@@ -18,7 +18,7 @@ from torch import Tensor, tensor
 from torch.nn.functional import cross_entropy
 from torchmetrics.metric import Metric
 
-from .utils import get_euclidean_targets, get_prob_targets
+from MaskAD.metrics.utils_target import get_euclidean_targets, get_prob_targets
 
 
 class CrossEntropy(Metric):

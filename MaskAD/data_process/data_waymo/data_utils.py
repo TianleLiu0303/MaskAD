@@ -217,98 +217,163 @@ def tf_postprocess(example: dict[str, tf.Tensor]):
     scenario_id = example['scenario/id']
     return scenario_id, scenario
 
+import numpy as np
+
+import numpy as np
+
 def data_process_agent(
     scenario,
     max_num_objects=64,
     current_index=10,
     use_log=True,
-    selected_agents=None,
+    selected_agents=None,   # 这里不再推荐外部传，除非你也保证包含 sim_agents
     remove_history=False,
 ):
-    """
-    Process the data for surrounding agents in a given scenario.
-
-    Args:
-        scenario (datatypes.SimulatorState): The simulator state containing the agent data.
-        max_num_objects (int): The maximum number of objects to consider.
-        current_index (int): The current time index.
-        use_log (bool): Whether to use log trajectory or sim trajectory.
-        selected_agents (list[int] or None): List of agent IDs to consider. If None, all agents will be considered.
-
-    Returns:
-        tuple: A tuple containing the processed agent data, including:
-            - agents_history (ndarray): The history of agent trajectories. Shape: (max_object, history_length, 8)
-            - agents_future (ndarray): The future agent trajectories. Shape: (max_object, future_length, 5)
-            - agents_interested (ndarray): The interest level of agents. Shape: (max_object,)
-            - agents_type (ndarray): The type of agents. Shape: (max_object,)
-    """
-    if use_log:
-        log_trajectory = scenario.log_trajectory
-    else:
-        log_trajectory = scenario.sim_trajectory
+    log_trajectory = scenario.log_trajectory if use_log else scenario.sim_trajectory
     metadata = scenario.object_metadata
-    sdc_id = np.where(metadata.is_sdc)[0][0]
 
-    # calculate distance to sdc
-    if selected_agents is None:
-        sdc_position = np.asarray(log_trajectory.xy[sdc_id, current_index])
-        agents_positions = np.asarray(log_trajectory.xy[:, current_index])
-        distance_to_sdc = np.linalg.norm(agents_positions - sdc_position, axis=-1)
-        agent_ids = np.argsort(distance_to_sdc)[:max_num_objects]
-        agent_ids = np.sort(agent_ids)
-    else:
-        agent_ids = selected_agents
-            
-    ############# Get agents' trajectory #############
-    # feature: x, y, yaw, velx, vely, length, width, height
-    agents_history = np.zeros((max_num_objects, current_index+1, 8), dtype=np.float32)
+    # ===== 0) ego slot =====
+    sdc_id = int(np.where(np.asarray(metadata.is_sdc))[0][0])
+
+    # ===== 1) 评测必需 sim agents（slot & object_id）=====
+    # Waymax/Waymo submission 对齐：current_index 时刻 valid 的对象
+    valid_sim_agents = np.asarray(scenario.log_trajectory.valid[:, current_index]).astype(bool)
+    sim_agent_slots = np.where(valid_sim_agents)[0].astype(np.int32)  # slot indices
+    sim_agent_object_ids = np.asarray(metadata.ids)[sim_agent_slots].astype(np.int64)
+
+    # 去掉 ego 本人（避免重复）
+    sim_agent_slots_wo_ego = [int(s) for s in sim_agent_slots.tolist() if int(s) != sdc_id]
+
+    # ===== 2) 构造 64 slots：ego -> sim_agents -> nearest others -> -1 pad =====
+    chosen = [sdc_id] + sim_agent_slots_wo_ego
+    chosen_set = set(chosen)
+
+    # 如果 sim agents 数量本身就 >= 64（极少见，但需要处理）
+    if len(chosen) > max_num_objects:
+        # 强制保留 ego，并截断其余 sim agents
+        chosen = chosen[:max_num_objects]
+        chosen_set = set(chosen)
+
+    # 需要补齐：从 valid 的其他对象里按距离 ego 最近选
+    if len(chosen) < max_num_objects:
+        valid_mask = np.asarray(log_trajectory.valid[:, current_index]).astype(bool)
+        all_valid_slots = np.where(valid_mask)[0].astype(np.int32)
+
+        ego_xy = np.asarray(log_trajectory.xy[sdc_id, current_index])  # [2]
+
+        cand_slots = []
+        cand_dists = []
+        for a in all_valid_slots.tolist():
+            a = int(a)
+            if a in chosen_set:
+                continue
+            xy = np.asarray(log_trajectory.xy[a, current_index])
+            d = float(np.linalg.norm(xy - ego_xy))
+            cand_slots.append(a)
+            cand_dists.append(d)
+
+        if len(cand_slots) > 0:
+            order = np.argsort(np.asarray(cand_dists))
+            for idx in order:
+                if len(chosen) >= max_num_objects:
+                    break
+                a = cand_slots[int(idx)]
+                chosen.append(a)
+                chosen_set.add(a)
+
+    # 仍不足 64：用 -1 padding
+    if len(chosen) < max_num_objects:
+        chosen = chosen + [-1] * (max_num_objects - len(chosen))
+
+    agent_ids_slot = np.asarray(chosen[:max_num_objects], dtype=np.int32)
+
+    # ===== 3) 组装特征：history/future（z 独立存）=====
+    T_hist = current_index + 1
+    T_fut = log_trajectory.shape[1] - current_index
+
+    agents_history = np.zeros((max_num_objects, T_hist, 8), dtype=np.float32)  # xy,yaw,vx,vy,L,W,H
+    agents_future  = np.zeros((max_num_objects, T_fut, 5), dtype=np.float32)  # x,y,yaw,vx,vy
+
+    agents_z_history = np.zeros((max_num_objects, T_hist, 1), dtype=np.float32)
+    agents_z_future  = np.zeros((max_num_objects, T_fut, 1), dtype=np.float32)
+
     agents_type = np.zeros((max_num_objects,), dtype=np.int32)
     agents_interested = np.zeros((max_num_objects,), dtype=np.int32)
-    agents_future = np.zeros((max_num_objects, log_trajectory.shape[1]-current_index, 5), dtype=np.float32)
+    agent_object_ids = -np.ones((max_num_objects,), dtype=np.int64)  # true object_id
 
-    for i, a in enumerate(agent_ids):
-        agent_type = metadata.object_types[a]
-        valid = log_trajectory.valid[a][current_index]
-
-        if not valid:
+    for i, a in enumerate(agent_ids_slot):
+        a = int(a)
+        if a < 0:
             agents_interested[i] = 0
             continue
-            
-        if metadata.is_modeled[a] or metadata.objects_of_interest[a]:
+
+        valid_now = bool(np.asarray(log_trajectory.valid[a, current_index]))
+        if not valid_now:
+            agents_interested[i] = 0
+            continue
+
+        # interested：保留你原逻辑（可选）
+        if bool(metadata.is_modeled[a]) or bool(metadata.objects_of_interest[a]):
             agents_interested[i] = 10
         else:
             agents_interested[i] = 1
 
-        agents_type[i] = agent_type
+        agents_type[i] = int(np.asarray(metadata.object_types[a]))
+        agent_object_ids[i] = int(np.asarray(metadata.ids[a]))
+
+        # history
         agents_history[i] = np.column_stack([
-                log_trajectory.xy[a][:current_index+1, 0],
-                log_trajectory.xy[a][:current_index+1, 1],
-                log_trajectory.yaw[a][:current_index+1],
-                log_trajectory.vel_x[a][:current_index+1],
-                log_trajectory.vel_y[a][:current_index+1],
-                log_trajectory.length[a][:current_index+1],
-                log_trajectory.width[a][:current_index+1],
-                log_trajectory.height[a][:current_index+1],
-            ])
-        
-        agents_history[i][~log_trajectory.valid[a, :current_index+1]] = 0
+            np.asarray(log_trajectory.xy[a, :T_hist, 0]),
+            np.asarray(log_trajectory.xy[a, :T_hist, 1]),
+            np.asarray(log_trajectory.yaw[a, :T_hist]),
+            np.asarray(log_trajectory.vel_x[a, :T_hist]),
+            np.asarray(log_trajectory.vel_y[a, :T_hist]),
+            np.asarray(log_trajectory.length[a, :T_hist]),
+            np.asarray(log_trajectory.width[a, :T_hist]),
+            np.asarray(log_trajectory.height[a, :T_hist]),
+        ]).astype(np.float32)
 
+        if hasattr(log_trajectory, "z"):
+            agents_z_history[i, :, 0] = np.asarray(log_trajectory.z[a, :T_hist]).astype(np.float32)
+        elif hasattr(log_trajectory, "xyz"):
+            agents_z_history[i, :, 0] = np.asarray(log_trajectory.xyz[a, :T_hist, 2]).astype(np.float32)
+
+        hist_valid = np.asarray(log_trajectory.valid[a, :T_hist]).astype(bool)
+        agents_history[i, ~hist_valid] = 0.0
+        agents_z_history[i, ~hist_valid, 0] = 0.0
+
+        # future
         agents_future[i] = np.column_stack([
-                log_trajectory.xy[a][current_index:, 0],
-                log_trajectory.xy[a][current_index:, 1],
-                log_trajectory.yaw[a][current_index:],
-                log_trajectory.vel_x[a][current_index:],
-                log_trajectory.vel_y[a][current_index:]
-            ])
+            np.asarray(log_trajectory.xy[a, current_index:, 0]),
+            np.asarray(log_trajectory.xy[a, current_index:, 1]),
+            np.asarray(log_trajectory.yaw[a, current_index:]),
+            np.asarray(log_trajectory.vel_x[a, current_index:]),
+            np.asarray(log_trajectory.vel_y[a, current_index:]),
+        ]).astype(np.float32)
 
-        agents_future[i][~log_trajectory.valid[a, current_index:]] = 0  
+        if hasattr(log_trajectory, "z"):
+            agents_z_future[i, :, 0] = np.asarray(log_trajectory.z[a, current_index:]).astype(np.float32)
+        elif hasattr(log_trajectory, "xyz"):
+            agents_z_future[i, :, 0] = np.asarray(log_trajectory.xyz[a, current_index:, 2]).astype(np.float32)
 
-    # Remove history
+        fut_valid = np.asarray(log_trajectory.valid[a, current_index:]).astype(bool)
+        agents_future[i, ~fut_valid] = 0.0
+        agents_z_future[i, ~fut_valid, 0] = 0.0
+
     if remove_history:
-        agents_history[:, :-1] = 0
-    
-    
-    return (agents_history, agents_future, agents_interested, agents_type, agent_ids, sdc_id)
+        agents_history[:, :-1] = 0.0
+        agents_z_history[:, :-1, 0] = 0.0
+
+    return (
+        agents_history,
+        agents_future,
+        agents_z_history,
+        agents_z_future,
+        agents_interested,
+        agents_type,
+        agent_ids_slot,       # [64] slot index（含 -1 padding）
+        agent_object_ids,     # [64] true object_id（-1 表示 padding）
+    )
 
 def data_process_traffic_light(
     scenario,
@@ -324,7 +389,6 @@ def data_process_traffic_light(
         tuple: A tuple containing the processed traffic light points, lane IDs, and states.
     """
     traffic_lights = scenario.log_traffic_light
-
     ############# Get Traffic Lights #############
     traffic_lane_ids = np.asarray(traffic_lights.lane_ids)[:, current_index]
     traffic_light_states = np.asarray(traffic_lights.state)[:, current_index]
@@ -360,7 +424,12 @@ def data_process_scenario(
     Returns:
         dict: A dictionary containing the processed data.
     """
-    (agents_history, agents_future, agents_interested, agents_type, agents_id, sdc_id) = data_process_agent(
+    (
+    agents_history, agents_future,
+    agents_z_history, agents_z_future,
+    agents_interested, agents_type,
+    agent_ids_slot, agent_object_ids,
+    ) = data_process_agent(
         scenario,
         max_num_objects = max_num_objects,
         current_index = current_index,
@@ -459,19 +528,29 @@ def data_process_scenario(
     
     data_dict = {
         'agents_history': np.float32(agents_history),
+        'agents_future': np.float32(agents_future),
+
+        # 新增：z 独立保存
+        'agents_z_history': np.float32(agents_z_history),   # [M, Th, 1]
+        'agents_z_future':  np.float32(agents_z_future),    # [M, Tf, 1]
+
         'agents_interested': np.int32(agents_interested),
         'agents_type': np.int32(agents_type),
-        'agents_future': np.float32(agents_future), 
+
+        # slot 与 object_id 分开存（强烈建议）
+        'agents_slot': np.int32(agent_ids_slot),            # [M] slot index
+        'agents_object_id': np.int64(agent_object_ids),     # [M] true object id（submission/对齐用）
+
         'traffic_light_points': np.float32(traffic_light_points),
         'polylines': np.float32(polylines),
         'polylines_valid': np.int32(polylines_valid),
-         # 新增：Waymo 的 route_lanes（方案2）
-        'route_lanes': np.float32(route_lanes),                 # [K,P,5]
-        'route_lanes_valid': np.int32(route_lanes_valid),       # [K]
+
+        'route_lanes': np.float32(route_lanes),
+        'route_lanes_valid': np.int32(route_lanes_valid),
+
         'relations': np.float32(relations),
-        'agents_id': np.int32(agents_id),
-        'sdc_id': np.int32(sdc_id),
     }
+
     return data_dict
 
 def data_collate_fn(batch_list):

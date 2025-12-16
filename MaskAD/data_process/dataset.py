@@ -1,175 +1,220 @@
 import os
+import glob
+import pickle
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 import torch
-from torch.utils.data import Dataset
-
-from MaskAD.utils.train_utils import openjson, opendata
+from torch.utils.data import Dataset, DataLoader
 
 
-class MaskADataset(Dataset):
-    def __init__(self,
-                 data_dir: str,
-                 data_list: str,
-                 past_neighbor_num: int,
-                 predicted_neighbor_num: int,
-                 future_len: int):
-        """
-        data_dir: npz 数据所在目录
-        data_list: 一个 json 文件，里面是 npz 文件名的列表
-        past_neighbor_num: 过去邻居数量上限
-        predicted_neighbor_num: 预测邻居数量上限
-        future_len: 未来预测长度（可以用来裁剪 ego / neighbor future）
-        """
-        self.data_dir = data_dir
-        # data_list.json 里一般是 ["xxx_0001.npz", "xxx_0002.npz", ...]
-        self.data_list = openjson(data_list)
+# =========================
+# Collate
+# =========================
+def data_collate_fn(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    - 数值类: np.ndarray / torch.Tensor -> stack 成 torch.Tensor
+    - 字符串/对象类: scenario_id / tfrecord_path 等 -> 保留 list
+    """
+    if len(batch_list) == 0:
+        return {}
 
-        self._past_neighbor_num = past_neighbor_num
-        self._predicted_neighbor_num = predicted_neighbor_num
-        self._future_len = future_len
+    keys = batch_list[0].keys()
+    out: Dict[str, Any] = {}
+
+    for k in keys:
+        values = [b[k] for b in batch_list]
+
+        # 保留字符串/对象
+        if k in ("scenario_id", "tfrecord_path"):
+            out[k] = values
+            continue
+
+        # sdc_id 可能是 np.int32 标量
+        if isinstance(values[0], (np.generic, int, float)):
+            out[k] = torch.tensor(values, dtype=torch.long if "id" in k else torch.float32)
+            continue
+
+        # numpy -> torch
+        if isinstance(values[0], np.ndarray):
+            out[k] = torch.from_numpy(np.stack(values, axis=0))
+            continue
+
+        # torch -> stack
+        if torch.is_tensor(values[0]):
+            out[k] = torch.stack(values, dim=0)
+            continue
+
+        # fallback: 原样 list
+        out[k] = values
+
+    return out
+
+
+# =========================
+# Waymo Dataset (your format)
+# =========================
+class WaymoDataset(Dataset):
+    """
+    适配你目前 pickle 样本的字段格式：
+
+    必备（训练/推理常用）:
+      - agents_history:        (64, 11, 8)
+      - agents_future:         (64, 81, 5)
+      - agents_type:           (64,)
+      - traffic_light_points:  (16, 3)
+      - polylines:             (256, 30, 5)
+      - route_lanes:           (6, 30, 5)
+      - relations:             (336, 336, 3)  (可选)
+      - agents_id:             (64,)          (可选但 WOSAC metric 常用)
+      - sdc_id:                () scalar      (可选)
+      - scenario_id:           str            (必须保留字符串)
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        keep_keys: Optional[List[str]] = None,
+        strict: bool = False,
+        sort_files: bool = True,
+    ):
+        super().__init__()
+        self.data_list = glob.glob(os.path.join(data_dir, "*")) if data_dir is not None else []
+        if sort_files:
+            self.data_list = sorted(self.data_list)
+
+        # 只保留你关心的 key（不传就全保留）
+        self.keep_keys = keep_keys
+        self.strict = strict
+
+        self.__collate_fn__ = data_collate_fn
 
     def __len__(self):
         return len(self.data_list)
 
+    def _maybe_cast(self, x: Any):
+        """把 numpy float64/int64 等统一成 float32 / int64，避免后面训练不一致。"""
+        if isinstance(x, np.ndarray):
+            if x.dtype in (np.float64, np.float16):
+                return x.astype(np.float32)
+            if x.dtype in (np.int32, np.int16, np.int8):
+                return x.astype(np.int64)
+            return x
+        return x
+
+    def _postprocess_one(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        # 可选：过滤 key
+        if self.keep_keys is not None:
+            data = {k: data[k] for k in self.keep_keys if k in data}
+
+        # 必备字段检查（按你 pipeline 最少需要的）
+        required = ["agents_history", "agents_future", "agents_type", "traffic_light_points", "polylines", "route_lanes", "scenario_id"]
+        if self.strict:
+            for k in required:
+                if k not in data:
+                    raise KeyError(f"[WaymoDataset] missing key '{k}' in sample")
+
+        # dtype normalize
+        out: Dict[str, Any] = {}
+        for k, v in data.items():
+            out[k] = self._maybe_cast(v)
+
+        # 保证 scenario_id 是 str
+        if "scenario_id" in out and not isinstance(out["scenario_id"], str):
+            # 有些人会存成 bytes
+            if isinstance(out["scenario_id"], bytes):
+                out["scenario_id"] = out["scenario_id"].decode("utf-8")
+            else:
+                out["scenario_id"] = str(out["scenario_id"])
+
+        # sdc_id 可能是 np.int32 标量：保持为 python int，collate 会 tensorize
+        if "sdc_id" in out and isinstance(out["sdc_id"], np.generic):
+            out["sdc_id"] = int(out["sdc_id"])
+
+        return out
+
     def __getitem__(self, idx):
-        # 读取单个 npz 样本
-        filename = self.data_list[idx]
-        data = opendata(os.path.join(self.data_dir, filename))
+        pkl_path = self.data_list[idx]
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
 
-        # 原始字段（np.ndarray）
-        ego_current_state       = data['ego_current_state']          # [10] 或 [T0, D]
-        ego_agent_future        = data['ego_agent_future']           # [T_f, D_f]
+        if not isinstance(data, dict):
+            raise TypeError(f"[WaymoDataset] sample is not dict: {pkl_path}")
 
-        agents_past             = data['agents_past']       # [N_all, T_p, D_p]
-        neighbor_agents_future  = data['neighbor_agents_future']     # [N_all, T_f, D_f]
-
-        lanes                   = data['lanes']
-        lanes_speed_limit       = data['lanes_speed_limit']
-        lanes_has_speed_limit   = data['lanes_has_speed_limit']
-
-        route_lanes             = data['route_lanes']
-        route_lanes_speed_limit = data['route_lanes_speed_limit']
-        route_lanes_has_speed_limit = data['route_lanes_has_speed_limit']
-
-        static_objects          = data['static_objects']
-
-        # 截取邻居数量
-        # neighbor_agents_past   = neighbor_agents_past[:self._past_neighbor_num]
+        return self._postprocess_one(data)
 
 
-        # # ###### 此处为临时测试代码 ####################################################
-        # T_past = neighbor_agents_past.shape[1]
-        # D_past = neighbor_agents_past.shape[2]
-
-        # ego_past = torch.zeros((1, T_past, D_past), dtype=torch.float32)
-
-        # # 3. 拼成 agents_past: [1(ego) + N(nbr), T, D]
-        # agents_past = torch.cat([ego_past, torch.as_tensor(neighbor_agents_past)], dim=0)
-        # # 生成占位的采样轨迹和扩散时间（调试用）
-        # num_agents = agents_past.shape[0]
-        # T_future = ego_agent_future.shape[0]
-        # sampled_trajectories = torch.randn((num_agents, T_future, 4), dtype=torch.float32)
-        # diffusion_time = torch.randint(0, 1000, (1,), dtype=torch.long)
-        # ############################################################################
-
-        neighbor_agents_future = neighbor_agents_future[:self._predicted_neighbor_num]
-
-        # 可选：裁剪未来长度
-        if self._future_len is not None:
-            ego_agent_future       = ego_agent_future[:self._future_len]
-            neighbor_agents_future = neighbor_agents_future[:, :self._future_len]
-
-        # 转成 torch.Tensor（如果你后面全是 torch）
-        sample = {
-            "ego_current_state":          torch.as_tensor(ego_current_state).float(),
-            "ego_agent_future":           torch.as_tensor(ego_agent_future).float(),
-            # "neighbor_agents_past":       torch.as_tensor(neighbor_agents_past).float(),
-            'agents_past':                torch.as_tensor(agents_past).float(),
-            "neighbor_agents_future":     torch.as_tensor(neighbor_agents_future).float(),
-
-            "lanes":                      torch.as_tensor(lanes).float(),
-            "lanes_speed_limit":          torch.as_tensor(lanes_speed_limit).float(),
-            "lanes_has_speed_limit":      torch.as_tensor(lanes_has_speed_limit).bool(),
-
-            "route_lanes":                torch.as_tensor(route_lanes).float(),
-            "route_lanes_speed_limit":    torch.as_tensor(route_lanes_speed_limit).float(),
-            "route_lanes_has_speed_limit":torch.as_tensor(route_lanes_has_speed_limit).bool(),
-
-            "static_objects":             torch.as_tensor(static_objects).float(),
-        }
-
-        return sample
-
-
-
-
-############### test ###########################
-
-import os
-import torch
-from torch.utils.data import DataLoader # ← 改成你的文件名
-
-# =====================================
-# 测试主函数
-# =====================================
-
+# =========================
+# Test main
+# =========================
 def main():
-    # -------------------------------------
-    # 模拟配置项
-    # -------------------------------------
-    cfg = {
-        "train_data_path": "/mnt/pai-pdc-nas/tianle_DPR/nuplan/dataset/processed_data",
-        "train_list_path": "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/diffusion_planner.json",
+    """
+    1) 读取一个 batch
+    2) 打印字段 + shape
+    3) （可选）把 batch 挪到 GPU 并跑 MaskPlanner.forward_inference
+    """
+    data_dir = "/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed"  # TODO: 改成你的数据目录
 
-        "past_neighbor_num": 32,
-        "predicted_neighbor_num": 32,
-        "future_len": 80,
-
-        "batch_size": 2,
-        "num_workers": 2,
-    }
-
-    # -------------------------------------
-    # 构建 dataset
-    # -------------------------------------
-    train_dataset = MaskADataset(
-        data_dir=cfg["train_data_path"],
-        data_list=cfg["train_list_path"],
-        past_neighbor_num=cfg["past_neighbor_num"],
-        predicted_neighbor_num=cfg["predicted_neighbor_num"],
-        future_len=cfg["future_len"],
+    ds = WaymoDataset(
+        data_dir=data_dir,
+        keep_keys=None,    # 或者传一个 list，只保留关心字段
+        strict=False,
     )
 
-    print(f"训练集样本数: {len(train_dataset)}")
+    print("num samples:", len(ds))
+    assert len(ds) > 0, "dataset is empty, check data_dir"
 
-    # -------------------------------------
-    # DataLoader
-    # -------------------------------------
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg["batch_size"],
-        shuffle=True,
-        num_workers=cfg["num_workers"],
-        pin_memory=True,
-        drop_last=True,
+    loader = DataLoader(
+        ds,
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=ds.__collate_fn__,
+        pin_memory=False,
     )
 
-    # -------------------------------------
-    # 取一个 batch 进行测试
-    # -------------------------------------
-    print("\n=== 取一个 batch 测试输出 ===")
-    batch = next(iter(train_loader))
+    batch = next(iter(loader))
 
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            print(f"{k:25s} shape = {tuple(v.shape)} dtype = {v.dtype}")
+    print("\n=== batch keys ===")
+    for k in batch.keys():
+        v = batch[k]
+        if torch.is_tensor(v):
+            print(f"{k:22s} -> tensor {tuple(v.shape)} dtype={v.dtype}")
         else:
-            print(f"{k:25s} (非 Tensor 类型)")
+            # scenario_id / tfrecord_path 等
+            print(f"{k:22s} -> {type(v)} (len={len(v)}) example={v[0] if len(v)>0 else None}")
 
-    print("\n测试成功：Dataset → DataLoader → Batch 全流程正常运行！")
+    # -------- optional: run model inference sanity check --------
+    try:
+        from omegaconf import OmegaConf
+        from MaskAD.model.maskplanner_metric import MaskPlanner  # 你最终的 metric 版 MaskPlanner
+
+        cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/waymo.yaml"
+        cfg = OmegaConf.load(cfg_path)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = MaskPlanner(cfg).to(device)
+        model.eval()
+
+        # move tensor fields to device
+        batch_dev = {}
+        for k, v in batch.items():
+            if torch.is_tensor(v):
+                batch_dev[k] = v.to(device)
+            else:
+                batch_dev[k] = v
+
+        with torch.no_grad():
+            out = model.forward_inference(batch_dev)
+
+        pred = out["prediction"]
+        print("\n=== model forward_inference OK ===")
+        print("prediction:", tuple(pred.shape), pred.dtype, pred.device)
+
+    except Exception as e:
+        print("\n[optional] model inference test skipped/failed:")
+        print("   ", repr(e))
 
 
-# =====================================
-# 执行 main()
-# =====================================
 if __name__ == "__main__":
     main()

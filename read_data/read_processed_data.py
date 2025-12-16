@@ -10,14 +10,11 @@ def read_gz_file_with_fallback(file_path):
 
         for k,v in x.items():
             print(f"{k}: {type(v)}")
+            # print(v.shape)
             print(v.shape if hasattr(v, 'shape') else v)
-        # print("lanes_valid", x["lanes_valid"])
-    print(x["agents_type"])
-    print(x["agents_id"])
-    # print(x["agents_history"][10,:,:])
     print(x["agents_interested"])
-    # print(x["route_lanes"])
-    # print(x["route_lanes_valid"])
-gz_file="/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed/scenario_80b6930491b32cb0.pkl"
+    print(x["agents_slot"])
+    print(x["agents_object_id"])
+gz_file="/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed/scenario_befb50d537f4b734.pkl"
 
 content = read_gz_file_with_fallback(gz_file)

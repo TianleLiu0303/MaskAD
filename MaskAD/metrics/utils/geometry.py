@@ -11,22 +11,22 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from MaskAD.metrics.cross_entropy import CrossEntropy
-from MaskAD.metrics.ego_nll import EgoNLL
-from MaskAD.metrics.gmm_ade import GMMADE
-from MaskAD.metrics.min_ade import minADE
-from MaskAD.metrics.next_token_cls import TokenCls
-from MaskAD.metrics.wosac_metrics import WOSACMetrics
-from MaskAD.metrics.wosac_submission import WOSACSubmission
+import math
+
+import torch
 
 
+def angle_between_2d_vectors(
+    ctr_vector: torch.Tensor, nbr_vector: torch.Tensor
+) -> torch.Tensor:
+    return torch.atan2(
+        ctr_vector[..., 0] * nbr_vector[..., 1]
+        - ctr_vector[..., 1] * nbr_vector[..., 0],
+        (ctr_vector[..., :2] * nbr_vector[..., :2]).sum(dim=-1),
+    )
 
-from MaskAD.metrics.utils.geometry import angle_between_2d_vectors, wrap_angle
-from MaskAD.metrics.utils.rollout import (
-    cal_polygon_contour,
-    sample_next_gmm_traj,
-    sample_next_token_traj,
-    transform_to_global,
-    transform_to_local,
-)
-from MaskAD.metrics.utils.weight_init import weight_init
+
+def wrap_angle(
+    angle: torch.Tensor, min_val: float = -math.pi, max_val: float = math.pi
+) -> torch.Tensor:
+    return min_val + (angle + max_val) % (max_val - min_val)

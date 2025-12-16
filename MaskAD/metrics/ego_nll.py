@@ -18,7 +18,7 @@ from torch import Tensor, tensor
 from torch.distributions import Categorical, Independent, MixtureSameFamily, Normal
 from torchmetrics.metric import Metric
 
-from .utils import get_euclidean_targets
+from MaskAD.metrics.utils_target import get_euclidean_targets
 
 
 class EgoNLL(Metric):

@@ -79,6 +79,9 @@ def data_process(
                 data_dict['scenario_raw'] = scenario
             
         data_dict['scenario_id'] = scenario_id
+        # WOSACxuyao 
+        data_dict['tfrecord_path'] = data_dir
+
 
         with open(scenario_filename, 'wb') as f:
             pickle.dump(data_dict, f)

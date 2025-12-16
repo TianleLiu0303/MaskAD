@@ -21,7 +21,7 @@ train_logs/
 *.log
 *.out
 events.out.tfevents.*
-
+read_data/
 # ============================
 # NuPlan / Waymo data
 # ============================
