@@ -19,6 +19,7 @@ from torch.nn.functional import smooth_l1_loss, cross_entropy
 from MaskAD.metrics.wosac_submission import WOSACSubmission
 from MaskAD.metrics.wosac_metrics import WOSACMetrics
 from MaskAD.utils.wosac_utils import get_scenario_rollouts, get_scenario_id_int_tensor
+from MaskAD.metrics.min_ade import minADE
 
 class Diffusion_Encoder(nn.Module):
     def __init__(self, config):
@@ -110,7 +111,7 @@ class MaskPlannerMetric(pl.LightningModule):
         self.n_batch_wosac_metric = getattr(config, "n_batch_wosac_metric", 999999)
 
         self.wosac_metrics = WOSACMetrics(prefix="val_closed")   # 只算指标，不存 submission
-
+        self.minADE = minADE()
 
         self.mask_net = MaskNet(
             hidden_dim=config.hidden_dim,   # scene_feat 的 D 维
@@ -486,6 +487,41 @@ class MaskPlannerMetric(pl.LightningModule):
         agent_id = batch["agents_object_id"][:, :P].reshape(B * P)  # [B*P]
         agent_batch = torch.arange(B, device=device).unsqueeze(1).repeat(1, P).reshape(B * P)  # [B*P]
 
+        valid_agent = agent_id >= 0
+        agent_id = agent_id[valid_agent]
+        agent_batch = agent_batch[valid_agent]
+        pred_traj = pred_traj[valid_agent]
+        pred_z = pred_z[valid_agent]
+        pred_head = pred_head[valid_agent]
+
+       #########################   ADE     #######
+        # GT future xy from agents_future: [B, 64, 81, 5]
+# --------- ADE (minADE) ---------
+        # agents_future: [B, P, 81, 5]
+        gt_future = batch["agents_future"][:, :P]      # [B, P, 81, 5]
+
+        # ❗丢掉当前帧，只保留未来
+        gt_future = gt_future[:, :, 1:1+T]              # [B, P, 80, 5]
+
+        # target: GT xy
+        target = gt_future[..., :2]                     # [B, P, 80, 2]
+
+        # valid: 该帧 5 维全 0 → invalid
+        target_valid = (gt_future.abs().sum(dim=-1) != 0)   # [B, P, 80]
+
+        # flatten 成 [n_agent, ...]
+        target = target.reshape(B * P, T, 2)            # [B*P, 80, 2]
+        target_valid = target_valid.reshape(B * P, T)   # [B*P, 80]
+
+        # 用同一个 valid_agent mask 对齐
+        target = target[valid_agent]                    # [n_agent, 80, 2]
+        target_valid = target_valid[valid_agent]        # [n_agent, 80]
+
+        # update ADE
+        self.minADE.update(pred=pred_traj, target=target, target_valid=target_valid)
+
+        ########################################################################
+
         scenario_id = get_scenario_id_int_tensor(batch["scenario_id"], device=device)  # [B,16]
 
         scenario_rollouts = get_scenario_rollouts(
@@ -497,16 +533,24 @@ class MaskPlannerMetric(pl.LightningModule):
             pred_head=pred_head,
         )
 
-        print("have been here")
         # 4) update metric（注意：需要 tfrecord_path 是 List[str]，长度 B）
         if batch_idx < self.n_batch_wosac_metric:
-            self.wosac_metrics.update(batch["tfrecord_path"], scenario_rollouts)
+            self.wosac_metrics.update(
+                                        batch["tfrecord_path"],   # List[str], len=B
+                                        batch["scenario_id"],     # List[str], len=B  ✅新增
+                                        scenario_rollouts
+                                    )
     def on_validation_epoch_end(self):
         metrics = self.wosac_metrics.compute()
+        ade = self.minADE.compute()
+        print(f"minADE: {ade}")
+        for k,v in metrics.items():
+            print(f"{k}: {v}")
         if self.global_rank == 0:
             for k, v in metrics.items():
                 self.log(k, v, sync_dist=True, prog_bar=True)  # 或者 self.logger.log_metrics(metrics)
         self.wosac_metrics.reset()
+        self.minADE.reset()
 
 
 
@@ -544,20 +588,21 @@ def test():
         "agents_type": torch.randint(0, 6, (B, 64), device=device),
 
         "agents_slot": torch.tensor([
-            [  3,   0,   1,   2,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,  15,
-            16,  17,  18,  19,  20,  21,  22,  23,
-            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
-            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
-            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1]
+            [ 80,   4,  29,  20,  19,   0,   2,  12,   1,   6,  24,  30,  25,  31,
+            9,  27,  21,  16,  14,  13,  26,  10,   7,  18,  11,  17,  22,   3,
+            23,  32,  37,   5,   8,  38,
+            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+            -1,  -1,  -1,  -1]
         ], dtype=torch.int64),
 
         "agents_object_id": torch.tensor([
-            [248, 233, 238, 239, 215, 216, 213, 214, 212, 220, 219, 217, 218, 228, 227, 222,
-            211, 224, 225, 223, 232, 221, 226, 230, 231,
-            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            -1, -1, -1, -1]
+            [155,   5,  51,  38,  33,   0,   3,  18,   2,   9,  46,  54,  47,  57,
+            13,  49,  39,  27,  24,  19,  48,  14,  11,  29,  17,  28,  44,   4,
+            45,  58,  63,   6,  12,  64,
+            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+            -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+            -1,  -1,  -1,  -1]
         ], dtype=torch.int64),
 
         # ---------- Static ----------
@@ -572,8 +617,9 @@ def test():
         "route_lanes": torch.randn(B, 6, 30, 5, device=device),
 
         # ---------- Meta (可选，但推荐有) ----------
-        "scenario_id": ["befb50d537f4b734"]*B,
-        "tfrecord_path": ["/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module/validation_tfexample.tfrecord-00000-of-00150"]*B,
+        "scenario_id": ["214dfc443104674a"]*B,
+        # "tfrecord_path": ["/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module/validation_tfexample.tfrecord-00000-of-00150"]*B,
+        "tfrecord_path": ["/mnt/pai-pdc-nas/tianle_DPR/MaskAD/read_data/uncompressed_scenario_validation_validation.tfrecord-00000-of-00150"]*B
     }
 
     # ====== 3. eval：前向 + loss（不反传） ======

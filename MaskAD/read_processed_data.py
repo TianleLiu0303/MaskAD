@@ -12,9 +12,9 @@ def read_gz_file_with_fallback(file_path):
             print(f"{k}: {type(v)}")
             # print(v.shape)
             print(v.shape if hasattr(v, 'shape') else v)
-    print(x["agents_interested"])
     print(x["agents_slot"])
     print(x["agents_object_id"])
-gz_file="/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed/scenario_befb50d537f4b734.pkl"
+gz_file="/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed/scenario_214dfc443104674a.pkl"
 
 content = read_gz_file_with_fallback(gz_file)
+
