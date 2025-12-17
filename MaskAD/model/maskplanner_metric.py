@@ -448,7 +448,6 @@ class MaskPlannerMetric(pl.LightningModule):
         z0 = batch["agents_z_future"][:, :, 0, 0]          # [B, A]
         pred_z = z0.unsqueeze(-1).expand(-1, -1, 80)       # [B, A, 80]
         pred_z = pred_z.unsqueeze(2).expand(-1, -1, n_rollout, -1)  # [B, A, n_rollout, 80]
-    # [B,P,R,T]
         return pred_traj, pred_z, pred_head
 
 
@@ -543,9 +542,12 @@ class MaskPlannerMetric(pl.LightningModule):
     def on_validation_epoch_end(self):
         metrics = self.wosac_metrics.compute()
         ade = self.minADE.compute()
-        print(f"minADE: {ade}")
-        for k,v in metrics.items():
-            print(f"{k}: {v}")
+
+        self.log("val_minADE", ade, sync_dist=True, prog_bar=True)
+
+        # print(f"minADE: {ade}")
+        # for k,v in metrics.items():
+        #     print(f"{k}: {v}")
         if self.global_rank == 0:
             for k, v in metrics.items():
                 self.log(k, v, sync_dist=True, prog_bar=True)  # 或者 self.logger.log_metrics(metrics)

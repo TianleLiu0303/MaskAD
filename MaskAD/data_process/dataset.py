@@ -5,7 +5,33 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
+
+
+# =========================
+# Helpers
+# =========================
+_STR_KEYS = {"scenario_id", "tfrecord_path"}
+
+# 这些字段在你 pipeline 里明确是“离散标识/映射”
+_INT_KEYS_EXACT = {
+    "sdc_id",
+    "agents_type",
+    "agents_slot",
+    "agents_object_id",
+    "sim_agent_object_ids",
+}
+
+def _is_int_like_key(k: str) -> bool:
+    # 更稳的判定：优先 exact，再用后缀/包含判断
+    if k in _INT_KEYS_EXACT:
+        return True
+    lk = k.lower()
+    if lk.endswith("_id") or lk.endswith("_ids") or lk.endswith("_idx") or lk.endswith("_index"):
+        return True
+    if "object_id" in lk or "slot" in lk:
+        return True
+    return False
 
 
 # =========================
@@ -13,8 +39,10 @@ from torch.utils.data import Dataset, DataLoader
 # =========================
 def data_collate_fn(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    - 数值类: np.ndarray / torch.Tensor -> stack 成 torch.Tensor
-    - 字符串/对象类: scenario_id / tfrecord_path 等 -> 保留 list
+    设计原则：
+      - scenario_id / tfrecord_path: 保留为 List[str]
+      - 离散字段（*_id / *_object_id / *_slot / agents_type / sdc_id...）: int64
+      - 连续字段（轨迹/地图/点云等）: float32
     """
     if len(batch_list) == 0:
         return {}
@@ -23,29 +51,45 @@ def data_collate_fn(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
 
     for k in keys:
-        values = [b[k] for b in batch_list]
+        values = [b.get(k) for b in batch_list]
 
-        # 保留字符串/对象
-        if k in ("scenario_id", "tfrecord_path"):
+        # 1) 保留字符串字段
+        if k in _STR_KEYS:
             out[k] = values
             continue
 
-        # sdc_id 可能是 np.int32 标量
-        if isinstance(values[0], (np.generic, int, float)):
-            out[k] = torch.tensor(values, dtype=torch.long if "id" in k else torch.float32)
+        v0 = values[0]
+
+        # 2) 标量：np.generic / python number
+        if isinstance(v0, (np.generic, int, float)):
+            if _is_int_like_key(k):
+                out[k] = torch.tensor(values, dtype=torch.int64)
+            else:
+                out[k] = torch.tensor(values, dtype=torch.float32)
             continue
 
-        # numpy -> torch
-        if isinstance(values[0], np.ndarray):
-            out[k] = torch.from_numpy(np.stack(values, axis=0))
+        # 3) numpy array
+        if isinstance(v0, np.ndarray):
+            arr = np.stack(values, axis=0)
+            if _is_int_like_key(k):
+                out[k] = torch.from_numpy(arr.astype(np.int64))
+            else:
+                # 连续值统一 float32
+                if arr.dtype != np.float32:
+                    arr = arr.astype(np.float32)
+                out[k] = torch.from_numpy(arr)
             continue
 
-        # torch -> stack
-        if torch.is_tensor(values[0]):
-            out[k] = torch.stack(values, dim=0)
+        # 4) torch tensor
+        if torch.is_tensor(v0):
+            t = torch.stack(values, dim=0)
+            if _is_int_like_key(k):
+                out[k] = t.to(torch.int64)
+            else:
+                out[k] = t.to(torch.float32) if t.dtype in (torch.float64, torch.float16) else t
             continue
 
-        # fallback: 原样 list
+        # 5) 其它：原样 list（比如 dict/对象等）
         out[k] = values
 
     return out
@@ -55,22 +99,6 @@ def data_collate_fn(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Waymo Dataset (your format)
 # =========================
 class WaymoDataset(Dataset):
-    """
-    适配你目前 pickle 样本的字段格式：
-
-    必备（训练/推理常用）:
-      - agents_history:        (64, 11, 8)
-      - agents_future:         (64, 81, 5)
-      - agents_type:           (64,)
-      - traffic_light_points:  (16, 3)
-      - polylines:             (256, 30, 5)
-      - route_lanes:           (6, 30, 5)
-      - relations:             (336, 336, 3)  (可选)
-      - agents_id:             (64,)          (可选但 WOSAC metric 常用)
-      - sdc_id:                () scalar      (可选)
-      - scenario_id:           str            (必须保留字符串)
-    """
-
     def __init__(
         self,
         data_dir: str,
@@ -83,52 +111,87 @@ class WaymoDataset(Dataset):
         if sort_files:
             self.data_list = sorted(self.data_list)
 
-        # 只保留你关心的 key（不传就全保留）
         self.keep_keys = keep_keys
         self.strict = strict
-
         self.__collate_fn__ = data_collate_fn
 
     def __len__(self):
         return len(self.data_list)
 
-    def _maybe_cast(self, x: Any):
-        """把 numpy float64/int64 等统一成 float32 / int64，避免后面训练不一致。"""
-        if isinstance(x, np.ndarray):
-            if x.dtype in (np.float64, np.float16):
-                return x.astype(np.float32)
-            if x.dtype in (np.int32, np.int16, np.int8):
-                return x.astype(np.int64)
-            return x
+    def _maybe_cast_array(self, k: str, x: np.ndarray) -> np.ndarray:
+        """按字段语义统一 dtype，避免训练/评测中 int/float 混乱。"""
+        if _is_int_like_key(k):
+            # 注意：object_id/slot 允许 -1 padding，所以用 int64
+            return x.astype(np.int64, copy=False)
+
+        # 连续值统一 float32
+        if x.dtype != np.float32:
+            return x.astype(np.float32, copy=False)
         return x
 
+    def _normalize_keys(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """兼容常见命名差异/拼写错误，保证训练代码拿得到字段。"""
+        # 你之前出现过 agebts_z_future 的拼写
+        if "agents_z_future" not in data and "agebts_z_future" in data:
+            data["agents_z_future"] = data.pop("agebts_z_future")
+
+        # 有些数据可能没存 tfrecord_path（但 WOSAC 需要）
+        if "tfrecord_path" not in data:
+            data["tfrecord_path"] = ""  # 占位，建议你数据生成阶段补齐真实路径
+
+        return data
+
     def _postprocess_one(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._normalize_keys(data)
+
         # 可选：过滤 key
         if self.keep_keys is not None:
             data = {k: data[k] for k in self.keep_keys if k in data}
 
-        # 必备字段检查（按你 pipeline 最少需要的）
-        required = ["agents_history", "agents_future", "agents_type", "traffic_light_points", "polylines", "route_lanes", "scenario_id"]
+        # 必备字段（按你 MaskPlannerMetric 的 forward/validation 最少需要）
+        required = [
+            "agents_history",
+            "agents_future",
+            "agents_type",
+            "traffic_light_points",
+            "polylines",
+            "route_lanes",
+            "scenario_id",
+            # 验证/WOSAC 强烈建议
+            "agents_object_id",
+            "tfrecord_path",
+        ]
         if self.strict:
             for k in required:
                 if k not in data:
                     raise KeyError(f"[WaymoDataset] missing key '{k}' in sample")
 
-        # dtype normalize
         out: Dict[str, Any] = {}
         for k, v in data.items():
-            out[k] = self._maybe_cast(v)
+            if isinstance(v, np.ndarray):
+                out[k] = self._maybe_cast_array(k, v)
+            elif isinstance(v, np.generic):
+                # 标量：按语义转 python 标量，collate 再 tensorize
+                out[k] = int(v) if _is_int_like_key(k) else float(v)
+            else:
+                out[k] = v
 
-        # 保证 scenario_id 是 str
+        # scenario_id 保证是 str
         if "scenario_id" in out and not isinstance(out["scenario_id"], str):
-            # 有些人会存成 bytes
             if isinstance(out["scenario_id"], bytes):
                 out["scenario_id"] = out["scenario_id"].decode("utf-8")
             else:
                 out["scenario_id"] = str(out["scenario_id"])
 
-        # sdc_id 可能是 np.int32 标量：保持为 python int，collate 会 tensorize
-        if "sdc_id" in out and isinstance(out["sdc_id"], np.generic):
+        # tfrecord_path 保证是 str
+        if "tfrecord_path" in out and not isinstance(out["tfrecord_path"], str):
+            if isinstance(out["tfrecord_path"], bytes):
+                out["tfrecord_path"] = out["tfrecord_path"].decode("utf-8")
+            else:
+                out["tfrecord_path"] = str(out["tfrecord_path"])
+
+        # sdc_id 保持 python int（collate -> int64 tensor）
+        if "sdc_id" in out and isinstance(out["sdc_id"], (np.generic,)):
             out["sdc_id"] = int(out["sdc_id"])
 
         return out
@@ -142,79 +205,3 @@ class WaymoDataset(Dataset):
             raise TypeError(f"[WaymoDataset] sample is not dict: {pkl_path}")
 
         return self._postprocess_one(data)
-
-
-# =========================
-# Test main
-# =========================
-def main():
-    """
-    1) 读取一个 batch
-    2) 打印字段 + shape
-    3) （可选）把 batch 挪到 GPU 并跑 MaskPlanner.forward_inference
-    """
-    data_dir = "/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed"  # TODO: 改成你的数据目录
-
-    ds = WaymoDataset(
-        data_dir=data_dir,
-        keep_keys=None,    # 或者传一个 list，只保留关心字段
-        strict=False,
-    )
-
-    print("num samples:", len(ds))
-    assert len(ds) > 0, "dataset is empty, check data_dir"
-
-    loader = DataLoader(
-        ds,
-        batch_size=2,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=ds.__collate_fn__,
-        pin_memory=False,
-    )
-
-    batch = next(iter(loader))
-
-    print("\n=== batch keys ===")
-    for k in batch.keys():
-        v = batch[k]
-        if torch.is_tensor(v):
-            print(f"{k:22s} -> tensor {tuple(v.shape)} dtype={v.dtype}")
-        else:
-            # scenario_id / tfrecord_path 等
-            print(f"{k:22s} -> {type(v)} (len={len(v)}) example={v[0] if len(v)>0 else None}")
-
-    # -------- optional: run model inference sanity check --------
-    try:
-        from omegaconf import OmegaConf
-        from MaskAD.model.maskplanner_metric import MaskPlanner  # 你最终的 metric 版 MaskPlanner
-
-        cfg_path = "/mnt/pai-pdc-nas/tianle_DPR/MaskAD/config/waymo.yaml"
-        cfg = OmegaConf.load(cfg_path)
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = MaskPlanner(cfg).to(device)
-        model.eval()
-
-        # move tensor fields to device
-        batch_dev = {}
-        for k, v in batch.items():
-            if torch.is_tensor(v):
-                batch_dev[k] = v.to(device)
-            else:
-                batch_dev[k] = v
-
-        with torch.no_grad():
-            out = model.forward_inference(batch_dev)
-
-        pred = out["prediction"]
-        print("\n=== model forward_inference OK ===")
-        print("prediction:", tuple(pred.shape), pred.dtype, pred.device)
-
-    except Exception as e:
-        print("\n[optional] model inference test skipped/failed:")
-        print("   ", repr(e))
-
-
-if __name__ == "__main__":
-    main()

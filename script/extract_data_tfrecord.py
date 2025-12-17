@@ -78,7 +78,7 @@ def process_one_tfrecord(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/mnt/pai-pdc-nas/tianle_DPR/MaskAD/read_data",
+    parser.add_argument("--data_dir", type=str, default="/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module/tfrecord",
                         help="Directory containing scenario tfrecord files, or a single tfrecord file path.")
     parser.add_argument("--save_dir", type=str, default="/mnt/pai-pdc-nas/tianle_DPR/waymo/data_waymo/testing_module_processed/processed",
                         help="Output directory for .pkl files.")

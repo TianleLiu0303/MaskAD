@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from timm.models.layers import Mlp
+from timm.layers import Mlp
 from timm.layers import DropPath
 from MaskAD.model.modules.global_attention import JointAttention
 from MaskAD.model.utils import build_attn_bias_from_scene
