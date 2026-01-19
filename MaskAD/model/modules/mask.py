@@ -1,114 +1,170 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class MaskNet(nn.Module):
+class CrossAttnBlock(nn.Module):
     """
-    输入:
-        context_feat: [B, N_ctx, D]    # 所有场景 token (agents + lanes + static + tl...)
-        agent_feat:   [B, N_agent, D]  # 只包含车辆/可控 agent 的 token
-    输出:
-        mask:      [B, N_agent, T]
-        mask_emb:  [B, N_agent, T, d_model]
+    Transformer-style block with cross-attention only:
+      x = x + CrossAttn(LN(x), context)
+      x = x + FFN(LN(x))
     """
 
     def __init__(
         self,
-        hidden_dim=192,    # D
-        T_fut=80,          # 未来步数 T
-        d_model=4,         # 加到 DiT / 轨迹 embedding 的维度
-        time_emb_dim=64,
-        num_heads=4,
-        mlp_hidden=128,
+        d_model: int,
+        num_heads: int = 4,
+        ffn_ratio: float = 4.0,
+        dropout: float = 0.0,
     ):
         super().__init__()
-
-        self.T = T_fut
-
-        # 1. 时间 embedding
-        self.time_emb = nn.Embedding(T_fut, time_emb_dim)
-        self.time_proj = nn.Linear(time_emb_dim, hidden_dim)
-
-        # 2. cross-attn: time query → context tokens
+        self.ln1 = nn.LayerNorm(d_model)
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
+            embed_dim=d_model,
             num_heads=num_heads,
+            dropout=dropout,
             batch_first=True,
         )
+        self.ln2 = nn.LayerNorm(d_model)
 
-        # 3. MLP: (agent_feat, time_context) → scalar logit
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, mlp_hidden),
+        hidden = int(d_model * ffn_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden),
             nn.SiLU(),
-            nn.Linear(mlp_hidden, mlp_hidden),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, context, context_key_padding_mask=None):
+        """
+        x:       [B, Q, D]
+        context: [B, N_ctx, D]
+        """
+        h = self.ln1(x)
+        attn_out, _ = self.cross_attn(
+            query=h,
+            key=context,
+            value=context,
+            key_padding_mask=context_key_padding_mask,  # [B, N_ctx], True = PAD (optional)
+            need_weights=False,
+        )
+        x = x + attn_out
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+
+class MaskNet(nn.Module):
+    """
+    Inputs:
+        context_feat: [B, N_ctx, D]  scene tokens
+        agent_feat:   [B, N, D]      agent tokens (for producing N queries)
+    Output:
+        mask_flat:    [B, N*T]       flattened mask (values in [0,1])
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        T_fut: int = 80,
+        num_layers: int = 3,
+        num_heads: int = 4,
+        ffn_ratio: float = 4.0,
+        dropout: float = 0.0,
+        mlp_hidden: int = 256,
+    ):
+        super().__init__()
+        self.D = hidden_dim
+        self.T = T_fut
+
+        # (1) Learnable time query bank: [T, D]
+        # One learnable query vector per future timestep.
+        self.time_queries = nn.Parameter(torch.randn(T_fut, hidden_dim) * 0.02)
+
+        # (2) Agent-conditioned modulation: make queries agent-specific
+        # agent_feat -> per-agent offset added to each time query
+        self.agent_to_q = nn.Linear(hidden_dim, hidden_dim, bias=True)
+
+        # (3) Cross-attention blocks
+        self.blocks = nn.ModuleList([
+            CrossAttnBlock(
+                d_model=hidden_dim,
+                num_heads=num_heads,
+                ffn_ratio=ffn_ratio,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        # (4) Head: scalar logit per query token
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, mlp_hidden),
             nn.SiLU(),
             nn.Linear(mlp_hidden, 1),
         )
 
-        # 4. mask embedding
-        self.mask_emb_proj = nn.Linear(1, d_model)
-        self.emb_scale = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, context_feat, agent_feat):
+    def forward(
+        self,
+        context_feat: torch.Tensor,
+        agent_feat: torch.Tensor,
+        context_mask: torch.Tensor = None,
+    ):
         """
         context_feat: [B, N_ctx, D]
-        agent_feat:   [B, N_agent, D]
+        agent_feat:   [B, N, D]
+        context_mask: [B, N_ctx] True for padding tokens (optional)
         """
         B, N_ctx, D = context_feat.shape
-        _, N_agent, D_a = agent_feat.shape
-        assert D == D_a, "context_feat 和 agent_feat 的通道维度 D 必须一致"
+        B2, N, D2 = agent_feat.shape
+        assert B == B2 and D == self.D and D2 == self.D
 
-        # K, V 用所有场景 token
-        K = context_feat
-        V = context_feat
+        # ---------------------------------------------------------
+        # Build learnable queries for each (agent, time)
+        # ---------------------------------------------------------
+        # base time queries: [T, D] -> [1, 1, T, D] -> [B, N, T, D]
+        q_time = self.time_queries.view(1, 1, self.T, self.D).expand(B, N, self.T, self.D)
 
-        # ---- Step 1: time embeddings → Q ----
-        t_ids = torch.arange(self.T, device=context_feat.device)    # [T]
-        t_emb = self.time_emb(t_ids)                               # [T, time_emb_dim]
-        t_emb = self.time_proj(t_emb)                              # [T, D]
-        Q = t_emb.unsqueeze(0).expand(B, self.T, D)                # [B, T, D]
+        # agent modulation: [B, N, D] -> [B, N, 1, D] -> [B, N, T, D]
+        q_agent = self.agent_to_q(agent_feat).unsqueeze(2).expand(B, N, self.T, self.D)
 
-        # ---- Step 2: cross-attention ----
-        # Q: [B,T,D], K/V: [B,N_ctx,D]
-        attn_out, attn_weights = self.cross_attn(Q, K, V)          # attn_out: [B,T,D]
+        # final query tokens: [B, N, T, D] -> flatten -> [B, N*T, D]
+        q = (q_time + q_agent).reshape(B, N * self.T, self.D)
 
-        # ---- Step 3: broadcast 到 N_agent ----
-        attn_expanded = attn_out.unsqueeze(1).expand(B, N_agent, self.T, D)   # [B,N_agent,T,D]
-        agent_expanded = agent_feat.unsqueeze(2).expand(B, N_agent, self.T, D)  # [B,N_agent,T,D]
+        # ---------------------------------------------------------
+        # Cross-attention: queries attend to scene context
+        # ---------------------------------------------------------
+        x = q
+        for blk in self.blocks:
+            x = blk(x, context_feat, context_key_padding_mask=context_mask)
 
-        # ---- Step 4: MLP → mask logits ----
-        feat = torch.cat([agent_expanded, attn_expanded], dim=-1)  # [B,N_agent,T,2D]
-        logits = self.mlp(feat).squeeze(-1)                        # [B,N_agent,T]
+        # ---------------------------------------------------------
+        # Head -> logits -> sigmoid -> flatten mask [B, N*T]
+        # ---------------------------------------------------------
+        logits = self.head(x).squeeze(-1)     # [B, N*T]
+        mask_flat = torch.sigmoid(logits)     # [B, N*T] in [0,1]
 
-        mask = torch.sigmoid(logits)                               # [B,N_agent,T]
-
-        # ---- Step 5: mask embedding ----
-        mask_emb = self.mask_emb_proj(mask.unsqueeze(-1)) * self.emb_scale
-        # [B,N_agent,T,1] → [B,N_agent,T,d_model]
-
-        return mask, mask_emb
+        return mask_flat
 
 
 if __name__ == "__main__":
-    # 简单测试
     B = 2
-    N_ctx = 107    # 所有 token 数量
-    N_agent = 33   # 车辆数
-    D = 192
-    T_fut = 80
-    d_model = 4
+    N_ctx = 336
+    N = 64
+    D = 256
+    T = 80
 
     context_feat = torch.randn(B, N_ctx, D)
-    agent_feat   = torch.randn(B, N_agent, D)
+    agent_feat = torch.randn(B, N, D)
 
     model = MaskNet(
         hidden_dim=D,
-        T_fut=T_fut,
-        d_model=d_model,
+        T_fut=T,
+        num_layers=4,
+        num_heads=8,
+        ffn_ratio=4.0,
+        dropout=0.0,
+        mlp_hidden=256,
     )
 
-    mask, mask_emb = model(context_feat, agent_feat)
-
-    print("mask shape:", mask.shape)        # [B, N_agent, T]
-    print("mask_emb shape:", mask_emb.shape)  # [B, N_agent, T, d_model]
+    mask_flat = model(context_feat, agent_feat)
+    print("mask_flat shape:", mask_flat.shape)  # [B, N*T]
